@@ -1,0 +1,51 @@
+{
+    "editor.formatOnSave": true,
+    // 기본 포매터를 clang-format으로
+    "[cpp]": {
+        "editor.defaultFormatter": "xaver.clang-format"
+    },
+    "[c]": {
+        "editor.defaultFormatter": "xaver.clang-format"
+    },
+    // clang-format 경로 (시스템 PATH에 없으면 직접 지정)
+    "clang-format.executable": "clang-format",
+    // 사용할 스타일 (Google, LLVM, Chromium, Mozilla, WebKit, Microsoft, file)
+    "clang-format.style": "file",
+    "files.associations": {
+        "thread.h": "c",
+        "random": "c",
+        "synch.h": "c",
+        "flags.h": "c",
+        "fixed-point.h": "c",
+        "tests.h": "c",
+        "syscall.h": "c",
+        "loader.h": "c",
+        "interrupt.h": "c",
+        "stdlib.h": "c",
+        "malloc.h": "c",
+        "console.h": "c",
+        "stdio.h": "c",
+        "intrinsic.h": "c",
+        "gdt.h": "c",
+        "file.h": "c",
+        "init.h": "c",
+        "debug.h": "c",
+        "filesys.h": "c",
+        "string.h": "c",
+        "palloc.h": "c",
+        "input.h": "c",
+        "vaddr.h": "c",
+        "directory.h": "c",
+        "syscall-nr.h": "c",
+        "process.h": "c",
+        "lib.h": "c",
+        "numbers": "c",
+        "list.h": "c",
+        "inttypes.h": "c",
+        "typeinfo": "c",
+        "stdbool.h": "c",
+        "mmu.h": "c",
+        "hash.h": "c"
+    },
+    "C_Cpp.errorSquiggles": "disabled"
+}
