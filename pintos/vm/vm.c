@@ -9,7 +9,7 @@
 #include "vm/file.h"
 #include "vm/uninit.h"
 
-static unsigned spt_hash(const struct hash_elem *e, void *aux) {
+static uint64_t spt_hash(const struct hash_elem *e, void *aux) {
   const struct page *p = hash_entry(e, struct page, spt_elem);
   return hash_bytes(&p->va, sizeof p->va);
 }
@@ -95,18 +95,18 @@ vm_alloc_page_with_initializer (enum vm_type type, void *upage, bool writable,
 		page->va = upage;
 		page->writable = writable;
 
-		/* 타입별 초기화기 */
-		page_initializer init_page = NULL;
+		/* 타입별 초기화 */
+ 	 	bool (*type_init)(struct page *, enum vm_type, void *kva) = NULL;
 		switch (VM_TYPE(type)) {
-			case VM_ANON: init_page = anon_initializer; break;
-			case VM_FILE: init_page = file_backed_initializer; break;
+			case VM_ANON: type_init = anon_initializer; break;
+			case VM_FILE: type_init = file_backed_initializer; break;
 			default:
 				free(page);
 				goto err;
 		}
 
 		/* uninit 래퍼 구성 (lazy load) */
-		uninit_new(page, upage, init, type, aux, init_page);
+		uninit_new(page, upage, init, type, aux, type_init);
 
 		/* TODO: Insert the page into the spt. */
 		/* TODO: 페이지를 보조 페이지 테이블에 삽입한다. */
@@ -140,7 +140,6 @@ spt_find_page (struct supplemental_page_table *spt UNUSED, void *va UNUSED) {
 bool
 spt_insert_page (struct supplemental_page_table *spt UNUSED,
 		struct page *page UNUSED) {
-	int succ = false;
 	/* TODO: Fill this function. */
 	/* TODO: 이 함수를 구현하라. */
 	page->va = pg_round_down(page->va);
