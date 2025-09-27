@@ -4,6 +4,21 @@
 #include "threads/malloc.h"
 #include "vm/vm.h"
 #include "vm/inspect.h"
+#include "threads/mmu.h"
+#include "vm/anon.h"
+#include "vm/file.h"
+#include "vm/uninit.h"
+
+static unsigned spt_hash(const struct hash_elem *e, void *aux) {
+  const struct page *p = hash_entry(e, struct page, spt_elem);
+  return hash_bytes(&p->va, sizeof p->va);
+}
+
+static bool spt_less(const struct hash_elem *a, const struct hash_elem *b, void *aux) {
+  const struct page *pa = hash_entry(a, struct page, spt_elem);
+  const struct page *pb = hash_entry(b, struct page, spt_elem);
+  return pa->va < pb->va;
+}
 
 /* Initializes the virtual memory subsystem by invoking each subsystem's
  * intialize codes. */
@@ -59,6 +74,9 @@ vm_alloc_page_with_initializer (enum vm_type type, void *upage, bool writable,
 
 	struct supplemental_page_table *spt = &thread_current ()->spt;
 
+	/* 페이지 정렬 보장 */
+	upage = pg_round_down(upage);
+  
 	/* Check wheter the upage is already occupied or not. */
 	/* upage가 이미 점유되어 있는지 확인한다. */
 	if (spt_find_page (spt, upage) == NULL) {
@@ -69,8 +87,34 @@ vm_alloc_page_with_initializer (enum vm_type type, void *upage, bool writable,
 		 * TODO: 그리고 uninit_new를 호출하여 "uninit" 페이지 구조체를 생성한다.
 		 * TODO: uninit_new 호출 이후에 필드를 수정해야 한다. */
 
+		/* 페이지 객체 생성 */
+		struct page *page = calloc(1, sizeof *page);
+		if (page == NULL)
+			goto err;
+
+		page->va = upage;
+		page->writable = writable;
+
+		/* 타입별 초기화기 */
+		page_initializer init_page = NULL;
+		switch (VM_TYPE(type)) {
+			case VM_ANON: init_page = anon_initializer; break;
+			case VM_FILE: init_page = file_backed_initializer; break;
+			default:
+				free(page);
+				goto err;
+		}
+
+		/* uninit 래퍼 구성 (lazy load) */
+		uninit_new(page, upage, init, type, aux, init_page);
+
 		/* TODO: Insert the page into the spt. */
 		/* TODO: 페이지를 보조 페이지 테이블에 삽입한다. */
+		if (!spt_insert_page(spt, page)) {
+			free(page);
+			goto err;
+		}
+		return true;
 	}
 err:
 	return false;
@@ -84,8 +128,11 @@ spt_find_page (struct supplemental_page_table *spt UNUSED, void *va UNUSED) {
 	struct page *page = NULL;
 	/* TODO: Fill this function. */
 	/* TODO: 이 함수를 구현하라. */
-
-	return page;
+	if (!spt) return NULL;
+	struct page key;
+	key.va = pg_round_down(va);
+	struct hash_elem *e = hash_find(&spt->h, &key.spt_elem);
+	return e ? hash_entry(e, struct page, spt_elem) : NULL;
 }
 
 /* Insert PAGE into spt with validation. */
@@ -96,14 +143,16 @@ spt_insert_page (struct supplemental_page_table *spt UNUSED,
 	int succ = false;
 	/* TODO: Fill this function. */
 	/* TODO: 이 함수를 구현하라. */
-
-	return succ;
+	page->va = pg_round_down(page->va);
+	struct hash_elem *old = hash_insert(&spt->h, &page->spt_elem);
+	return old == NULL;
 }
 
 void
 spt_remove_page (struct supplemental_page_table *spt, struct page *page) {
-	vm_dealloc_page (page);
-	return true;
+	if (!page) return;
+	hash_delete(&spt->h, &page->spt_elem);
+	vm_dealloc_page(page);
 }
 
 /* Get the struct frame, that will be evicted. */
@@ -218,6 +267,7 @@ vm_do_claim_page (struct page *page) {
 /* 새로운 보조 페이지 테이블을 초기화한다. */
 void
 supplemental_page_table_init (struct supplemental_page_table *spt UNUSED) {
+	hash_init(&spt->h, spt_hash, spt_less, NULL);
 }
 
 /* Copy supplemental page table from src to dst */
