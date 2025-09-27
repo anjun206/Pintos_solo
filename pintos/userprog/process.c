@@ -37,22 +37,32 @@ static bool duplicate_pte (uint64_t *pte, void *va, void *aux);
 
 /* 부모가 만든 자식 상태 노드와 커맨드라인을 자식에게 건네기 위한 구조체 */
 struct exec_info {
-  char *cmdline;                 /* palloc_get_page()로 복사한 커맨드라인 */
-  struct child_status *cs;       /* 부모가 만들어 children에 넣어둔 노드 */
+	char *cmdline;                 /* palloc_get_page()로 복사한 커맨드라인 */
+	struct child_status *cs;       /* 부모가 만들어 children에 넣어둔 노드 */
 };
 
 struct fork_args {
-  struct thread *parent;
-  struct intr_frame parent_if;  // 사본으로 전달
-  struct child_status *cs;
+	struct thread *parent;
+	struct intr_frame parent_if;  // 사본으로 전달
+	struct child_status *cs;
 };
 
 /* 제대로된 dup2 */
 struct dupmap_ent {
-  struct file *parent_fp;         // 키
-  struct file *child_fp;          // 값
-  struct hash_elem elem;
+	struct file *parent_fp;         // 키
+	struct file *child_fp;          // 값
+	struct hash_elem elem;
 };
+
+/* vm용 구조체 */
+#ifdef VM
+struct load_aux {
+	struct file *file;
+	off_t ofs;
+	size_t read_bytes;
+	size_t zero_bytes;
+};
+#endif
 
 
 /* General process initializer for initd and other process. */
@@ -68,23 +78,23 @@ process_init (void) {
 
 /* 해시 */
 static unsigned dupmap_hash (const struct hash_elem *e, void *aux) {
-  const struct dupmap_ent *x = hash_entry(e, struct dupmap_ent, elem);
-  return hash_bytes(&x->parent_fp, sizeof x->parent_fp);
+	const struct dupmap_ent *x = hash_entry(e, struct dupmap_ent, elem);
+	return hash_bytes(&x->parent_fp, sizeof x->parent_fp);
 }
 static bool dupmap_less (const struct hash_elem *a, const struct hash_elem *b, void *aux) {
-  const struct dupmap_ent *xa = hash_entry(a, struct dupmap_ent, elem);
-  const struct dupmap_ent *xb = hash_entry(b, struct dupmap_ent, elem);
-  return (uintptr_t)xa->parent_fp < (uintptr_t)xb->parent_fp;
+	const struct dupmap_ent *xa = hash_entry(a, struct dupmap_ent, elem);
+	const struct dupmap_ent *xb = hash_entry(b, struct dupmap_ent, elem);
+	return (uintptr_t)xa->parent_fp < (uintptr_t)xb->parent_fp;
 }
 static struct dupmap_ent *dupmap_find (struct hash *m, struct file *parent_fp) {
-  struct dupmap_ent key;
-  key.parent_fp = parent_fp;
-  struct hash_elem *e = hash_find(m, &key.elem);
-  return e ? hash_entry(e, struct dupmap_ent, elem) : NULL;
+	struct dupmap_ent key;
+	key.parent_fp = parent_fp;
+	struct hash_elem *e = hash_find(m, &key.elem);
+	return e ? hash_entry(e, struct dupmap_ent, elem) : NULL;
 }
 static void dupmap_free_action(struct hash_elem *e, void *aux) {
-  struct dupmap_ent *ent = hash_entry(e, struct dupmap_ent, elem);
-  free(ent);
+	struct dupmap_ent *ent = hash_entry(e, struct dupmap_ent, elem);
+	free(ent);
 }
 
 /* Starts the first userland program, called "initd", loaded from FILE_NAME.
@@ -1145,7 +1155,7 @@ install_page (void *upage, void *kpage, bool writable) {
  * 프로젝트 2에서만 사용할 구현은 위쪽 블록에 작성하라. */
 
 static bool
-lazy_load_segment (struct page *page, void *aux) {
+lazy_load_segment (struct page *page, void *aux_) {
 	/* TODO: Load the segment from the file */
 	/* TODO: 파일에서 세그먼트를 적재한다. */
 
@@ -1154,6 +1164,26 @@ lazy_load_segment (struct page *page, void *aux) {
 
 	/* TODO: VA is available when calling this function. */
 	/* TODO: 이 함수를 호출할 때 VA는 유효하다. */
+
+	struct load_aux *aux = aux_;
+	void *kva = page->frame->kva;
+
+	/* 파일에서 필요한 만큼 읽기 */
+	if (aux->read_bytes > 0) {
+		int n = file_read_at(aux->file, kva, aux->read_bytes, aux->ofs);
+		if (n != (int)aux->read_bytes) {
+			free(aux);
+			return false;
+		}
+  	}
+
+	/* 남은 공간 0으로 채우기 */
+  	if (aux->zero_bytes > 0) {
+    	memset((uint8_t *)kva + aux->read_bytes, 0, aux->zero_bytes);
+  	}
+	
+	free(aux);
+	return true;
 }
 
 /* Loads a segment starting at offset OFS in FILE at address
@@ -1200,16 +1230,26 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 
 		/* TODO: Set up aux to pass information to the lazy_load_segment. */
 		/* TODO: lazy_load_segment에 정보를 전달하기 위한 aux를 설정한다. */
-		void *aux = NULL;
-		if (!vm_alloc_page_with_initializer (VM_ANON, upage,
-					writable, lazy_load_segment, aux))
+		struct load_aux *aux = malloc(sizeof *aux);
+		if (!aux) return false;
+		aux->file = file;
+		aux->ofs  = ofs;
+		aux->read_bytes = page_read_bytes;
+		aux->zero_bytes = page_zero_bytes;
+
+		/* 파일-백드 페이지로 lazy 등록 */
+		if (!vm_alloc_page_with_initializer(VM_FILE, upage, writable,
+											lazy_load_segment, aux)) {
+			free(aux);
 			return false;
+		}
 
 		/* Advance. */
 		/* 다음 페이지로 진행. */
 		read_bytes -= page_read_bytes;
 		zero_bytes -= page_zero_bytes;
-		upage += PGSIZE;
+		upage 	   += PGSIZE;
+		ofs   	   += page_read_bytes;
 	}
 	return true;
 }
@@ -1227,9 +1267,19 @@ setup_stack (struct intr_frame *if_) {
 	/* TODO: stack_bottom에 스택을 매핑하고 즉시 페이지를 클레임한다.
 	 * TODO: 성공했다면 rsp를 적절히 설정한다.
 	 * TODO: 해당 페이지가 스택임을 표시해야 한다. */
-	/* TODO: Your code goes here */
-	/* TODO: 여기에 코드를 작성한다. */
 
+	/* 스택 페이지 VM에 등록 */
+	if (!vm_alloc_page_with_initializer(VM_ANON | VM_MARKER_0,
+										stack_bottom, true,
+									 	NULL, NULL))
+		return false;
+	
+	/* 즉시 클레임 */
+	if (!vm_claim_page(stack_bottom))
+		return false;
+
+	if_->rsp = USER_STACK;
+  	success = true;
 	return success;
 }
 #endif /* VM */

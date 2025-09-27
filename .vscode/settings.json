@@ -46,7 +46,8 @@
         "stdbool.h": "c",
         "mmu.h": "c",
         "hash.h": "c",
-        "vm.h": "c"
+        "vm.h": "c",
+        "atomic": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }

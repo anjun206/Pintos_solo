@@ -188,12 +188,19 @@ vm_evict_frame (void) {
  * 즉, 사용자 풀 메모리가 가득 찼을 경우 이 함수는 프레임을 제거해 가용 메모리를 확보한다. */
 static struct frame *
 vm_get_frame (void) {
-	struct frame *frame = NULL;
+	void *kva = palloc_get_page(PAL_USER);
+
+	// oom시 아직은 패닉으로 처리 나중에 evict로 대체
+	if (kva == NULL) PANIC("vm get frame 실패");
+
+	struct frame *frame = malloc(sizeof *frame);
 	/* TODO: Fill this function. */
 	/* TODO: 이 함수를 구현하라. */
 
 	ASSERT (frame != NULL);
-	ASSERT (frame->page == NULL);
+	frame->kva = kva;
+	frame->page = NULL
+	// 나중에 프레임에 추가 기능
 	return frame;
 }
 
@@ -212,16 +219,22 @@ vm_handle_wp (struct page *page UNUSED) {
 /* Return true on success */
 /* 성공 시 true를 반환한다. */
 bool
-vm_try_handle_fault (struct intr_frame *f UNUSED, void *addr UNUSED,
-		bool user UNUSED, bool write UNUSED, bool not_present UNUSED) {
-	struct supplemental_page_table *spt UNUSED = &thread_current ()->spt;
-	struct page *page = NULL;
+vm_try_handle_fault (struct intr_frame *f, void *addr,
+		bool user, bool write, bool not_present) {
+	if (!not_present) return false;
+	if (!is_user_vaddr(addr) || addr == NULL) return false;
+
 	/* TODO: Validate the fault */
 	/* TODO: 페이지 폴트를 검증한다. */
+	void *uva = pg_round_down(addr);
+	struct page *page = spt_find_page(&thread_current()->spt, uva);
+	if (page) return vm_do_claim_page (page);
+	
 	/* TODO: Your code goes here */
 	/* TODO: 여기에 코드를 작성하라. */
 
-	return vm_do_claim_page (page);
+	// 스택 성장 구현 후 코드 구현
+	return false;
 }
 
 /* Free the page.
@@ -241,7 +254,8 @@ vm_claim_page (void *va UNUSED) {
 	struct page *page = NULL;
 	/* TODO: Fill this function */
 	/* TODO: 이 함수를 구현하라. */
-
+	va = pg_round_down(va);
+	page = spt_find_page(&thread_current()->spt, va);
 	return vm_do_claim_page (page);
 }
 
@@ -258,8 +272,17 @@ vm_do_claim_page (struct page *page) {
 
 	/* TODO: Insert page table entry to map page's VA to frame's PA. */
 	/* TODO: 페이지의 VA를 프레임의 PA에 매핑하는 페이지 테이블 엔트리를 삽입한다. */
+	if (!swap_in(page, frame->kva)) {
+		frame->page = NULL;
+		page->frame = NULL;
+		return false;
+	}
 
-	return swap_in (page, frame->kva);
+	if (!pml4_set_page(thread_current()->pml4, page->va, frame->kva, page->writable)) {
+		return false;
+	}
+
+	return true;
 }
 
 /* Initialize new supplemental page table */
