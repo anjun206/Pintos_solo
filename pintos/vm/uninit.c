@@ -10,6 +10,7 @@
 
 #include "vm/vm.h"
 #include "vm/uninit.h"
+#define PGSIZE  (1 << 12)
 
 static bool uninit_initialize (struct page *page, void *kva);
 static void uninit_destroy (struct page *page);
@@ -51,9 +52,23 @@ uninit_initialize (struct page *page, void *kva) {
 	vm_initializer *init = uninit->init;
 	void *aux = uninit->aux;
 
-	/* TODO: You may need to fix this function. */
-	return uninit->page_initializer (page, uninit->type, kva) &&
-		(init ? init (page, aux) : true);
+	// 1) 실제 타입 초기화자(anon/file)가 ops 세팅
+	if (!uninit->page_initializer(page, uninit->type, kva))
+		return false;
+
+	// 2) lazy 초기화자(lazy_load_segment) 호출 or 스택이면 zero-fill
+	bool ok = true;
+	if (init) {
+		ok = init(page, aux);     // lazy_load_segment가 aux free 하면 여기서 끝
+	} else {
+		memset(kva, 0, PGSIZE);   // 스택 같은 케이스: 첫 페이지는 0으로
+	}
+
+	// 3) 포인터 정리(초기화 1회성)
+	uninit->init = NULL;
+	uninit->aux  = NULL;
+
+	return ok;
 }
 
 /* Free the resources hold by uninit_page. Although most of pages are transmuted

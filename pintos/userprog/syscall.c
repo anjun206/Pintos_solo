@@ -19,6 +19,10 @@
 #include "threads/synch.h"
 #include "list.h"
 #include "lib/kernel/hash.h"
+#ifdef VM
+#include "vm/vm.h"
+#endif
+
 
 struct lock filesys_lock;
 
@@ -41,6 +45,11 @@ void syscall_handler (struct intr_frame *);
 
 #define STDIN_FD  ((struct file*)-1)
 #define STDOUT_FD ((struct file*)-2)
+
+#ifdef VM
+#define STACK_MAX_BYTES (1 << 20)  /* 1 MiB 스택 최대 성장 폭 */
+#endif
+
 
 /* 프로토 타입 */
 static void system_halt(void) NO_RETURN;
@@ -77,6 +86,47 @@ static int  fd_alloc(struct file *f);   // 빈 슬롯 찾아 file* 넣고 fd 반
 static unsigned file_ref_hash(const struct hash_elem *e, void *aux);
 static bool file_ref_less(const struct hash_elem *a, const struct hash_elem *b, void *aux);
 static struct file_ref *ref_find(struct file *fp);
+
+/* vm 헬퍼 */
+#ifdef VM
+/* lazy 할당 시도 하는 함수 */
+static uint8_t *
+kmap_user_addr_or_claim(const void *uaddr, bool for_write) {
+  struct thread *t = thread_current();
+  if (uaddr == NULL || !is_user_vaddr(uaddr)) system_exit(-1);
+
+  void *upg = pg_round_down(uaddr);
+  void *kp = pml4_get_page(t->pml4, upg);
+
+  /* 커널 주소 없을때 */
+  if (kp == NULL) {
+    struct page *p = spt_find_page(&t->spt, upg);
+    if (p == NULL) {
+      /* 스택 성장: USER_STACK 한도 내에서 */
+      if ((uintptr_t)upg < (uintptr_t)USER_STACK &&
+          (uintptr_t)USER_STACK - (uintptr_t)upg <= STACK_MAX_BYTES) {
+        if (!vm_alloc_page(VM_ANON | VM_MARKER_0, upg, true))
+          system_exit(-1);
+        p = spt_find_page(&t->spt, upg);
+        if (p == NULL) system_exit(-1);
+      } else {
+        system_exit(-1);
+      }
+    }
+    if (for_write && !p->writable) system_exit(-1);
+    if (!vm_claim_page(upg)) system_exit(-1);
+    kp = pml4_get_page(t->pml4, upg);
+    if (kp == NULL) system_exit(-1);
+  } else {
+    /* SPT가 read-only이면 탈락 */
+    struct page *p = spt_find_page(&t->spt, upg);
+    if (for_write && p && !p->writable) system_exit(-1);
+  }
+
+  return (uint8_t *)kp + pg_ofs(uaddr);
+}
+#endif
+
 
 // dup2
 struct file_ref {
@@ -436,14 +486,18 @@ static void
 assert_user_range(const void *uaddr, size_t size) {
   if (uaddr == NULL) system_exit(-1);
   if (size == 0) return;
+
   const uint8_t *begin = (const uint8_t *)uaddr;
   const uint8_t *end   = begin + size - 1;
 
   // 범위를 페이지 경계 단위로 훑는다
   for (const uint8_t *p = pg_round_down(begin); p <= end; p += PGSIZE) {
-    if (!is_user_vaddr(p)) system_exit(-1);                 // 유저 주소 맞는지 체크
-    if (pml4_get_page(thread_current()->pml4, p) == NULL)   // p매핑 pml4에 되어있는지 체크
-      system_exit(-1);
+#ifdef VM
+    (void)kmap_user_addr_or_claim(p, false);
+#else
+    if (!is_user_vaddr(p)) system_exit(-1);
+    if (pml4_get_page(thread_current()->pml4, p) == NULL) system_exit(-1);
+#endif
   }
 }
 
@@ -455,12 +509,19 @@ copy_in_string(char *kdst, const char *usrc, size_t max_len) {
   while (i < max_len) {
     const uint8_t *u = (const uint8_t *)usrc + i;
 
+#ifdef VM
+    uint8_t *ksrc = kmap_user_addr_or_claim(u, false);
+
+#else
     if (!is_user_vaddr(u)) system_exit(-1);
 
     void *kp = pml4_get_page(thread_current()->pml4, pg_round_down(u));
     if (kp == NULL) system_exit(-1);
+    uint8_t *ksrc = (uint8_t *)kp + pg_ofs(u);
+#endif
 
-    char c = *(((char *)kp) + pg_ofs(u));  // base + ofs 로 1바이트 읽기
+
+    char c = *(char *)ksrc;
     kdst[i++] = c;
     if (c == '\0') return true;  // 정상 종료: 제한 내에서 NUL 발견
   }
@@ -475,15 +536,17 @@ copy_in(void *kdst, const void *usrc, size_t n) {
   const uint8_t *u = (const uint8_t *)usrc;
 
   while (n > 0) {
-    if (!is_user_vaddr(u)) system_exit(-1);
-
-    const void *kp = pml4_get_page(thread_current()->pml4, pg_round_down(u));
-    if (kp == NULL) system_exit(-1);
-
-    const uint8_t *ksrc = (const uint8_t *)kp + pg_ofs(u);
-
     size_t chunk = PGSIZE - pg_ofs(u);
     if (chunk > n) chunk = n;
+
+#ifdef VM
+    uint8_t *ksrc = kmap_user_addr_or_claim(u, false);
+#else
+    if (!is_user_vaddr(u)) system_exit(-1);
+    void *kp = pml4_get_page(thread_current()->pml4, pg_round_down(u));
+    if (kp == NULL) system_exit(-1);
+    uint8_t *ksrc = (uint8_t *)kp + pg_ofs(u);
+#endif
 
     memcpy(kd, ksrc, chunk);
     kd += chunk;
@@ -498,15 +561,17 @@ copy_out(void *udst, const void *ksrc, size_t n) {
   const uint8_t *k = (const uint8_t *)ksrc;
 
   while (n > 0) {
-    if (!is_user_vaddr(u)) system_exit(-1);
-
-    void *kp = pml4_get_page(thread_current()->pml4, pg_round_down(u));
-    if (kp == NULL) system_exit(-1);
-
-    uint8_t *kdst = (uint8_t *)kp + pg_ofs(u);
-
     size_t chunk = PGSIZE - pg_ofs(u);
     if (chunk > n) chunk = n;
+
+#ifdef VM
+    uint8_t *kdst = kmap_user_addr_or_claim(u, /*for_write=*/true);
+#else
+    if (!is_user_vaddr(u)) system_exit(-1);
+    void *kp = pml4_get_page(thread_current()->pml4, pg_round_down(u));
+    if (kp == NULL) system_exit(-1);
+    uint8_t *kdst = (uint8_t *)kp + pg_ofs(u);
+#endif
 
     memcpy(kdst, k, chunk);
     u += chunk;

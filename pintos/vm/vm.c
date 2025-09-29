@@ -9,6 +9,8 @@
 #include "vm/file.h"
 #include "vm/uninit.h"
 
+#define STACK_MAX_BYTES (1 << 20)  // 스택 성장 한계
+
 static uint64_t spt_hash(const struct hash_elem *e, void *aux) {
   const struct page *p = hash_entry(e, struct page, spt_elem);
   return hash_bytes(&p->va, sizeof p->va);
@@ -199,7 +201,7 @@ vm_get_frame (void) {
 
 	ASSERT (frame != NULL);
 	frame->kva = kva;
-	frame->page = NULL
+	frame->page = NULL;
 	// 나중에 프레임에 추가 기능
 	return frame;
 }
@@ -228,12 +230,37 @@ vm_try_handle_fault (struct intr_frame *f, void *addr,
 	/* TODO: 페이지 폴트를 검증한다. */
 	void *uva = pg_round_down(addr);
 	struct page *page = spt_find_page(&thread_current()->spt, uva);
-	if (page) return vm_do_claim_page (page);
-	
+	if (page != NULL) {
+		/* 쓰기 의도인데 read-only면 실패 */
+		if (write && !page->writable)
+		return false;
+		/* 실제 프레임을 확보하고 매핑 */
+		return vm_do_claim_page(page);
+	}
+
 	/* TODO: Your code goes here */
 	/* TODO: 여기에 코드를 작성하라. */
+	if (user) {
+		/* 현재 사용자 스택 포인터 */
+		void *rsp = (void *)f->rsp;
 
-	// 스택 성장 구현 후 코드 구현
+		/* 스택 상한 및 푸시/콜 슬랙 판정 */
+		bool below_user_stack = (uintptr_t)addr < (uintptr_t)USER_STACK;
+		bool within_limit =
+			((uintptr_t)USER_STACK - (uintptr_t)uva) <= (uintptr_t)STACK_MAX_BYTES;
+		bool near_rsp =
+			(uintptr_t)addr >= ((uintptr_t)rsp - 32) &&  /* push 등 여유 허용 */
+			(uintptr_t)addr <  (uintptr_t)USER_STACK;
+
+		if (below_user_stack && within_limit && near_rsp) {
+		/* 새 anonymous 스택 페이지를 등록하고 곧바로 클레임 */
+			if (!vm_alloc_page(VM_ANON | VM_MARKER_0, uva, true))
+				return false;
+			return vm_claim_page(uva);
+		}
+	}
+
+	/* 그 외는 처리 너가해 */
 	return false;
 }
 
@@ -256,6 +283,7 @@ vm_claim_page (void *va UNUSED) {
 	/* TODO: 이 함수를 구현하라. */
 	va = pg_round_down(va);
 	page = spt_find_page(&thread_current()->spt, va);
+	if (!page) return false;
 	return vm_do_claim_page (page);
 }
 

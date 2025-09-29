@@ -46,7 +46,7 @@ struct fork_args {
 	struct intr_frame parent_if;  // 사본으로 전달
 	struct child_status *cs;
 };
-
+	
 /* 제대로된 dup2 */
 struct dupmap_ent {
 	struct file *parent_fp;         // 키
@@ -1277,6 +1277,9 @@ setup_stack (struct intr_frame *if_) {
 	/* 즉시 클레임 */
 	if (!vm_claim_page(stack_bottom))
 		return false;
+
+	volatile uint8_t *probe = (uint8_t *)((uint8_t*)USER_STACK - 1);
+	*probe = 0; 
 
 	if_->rsp = USER_STACK;
   	success = true;
