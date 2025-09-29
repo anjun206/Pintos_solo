@@ -95,7 +95,6 @@ vm_alloc_page_with_initializer (enum vm_type type, void *upage, bool writable,
 			goto err;
 
 		page->va = upage;
-		page->writable = writable;
 
 		/* 타입별 초기화 */
  	 	bool (*type_init)(struct page *, enum vm_type, void *kva) = NULL;
@@ -109,6 +108,8 @@ vm_alloc_page_with_initializer (enum vm_type type, void *upage, bool writable,
 
 		/* uninit 래퍼 구성 (lazy load) */
 		uninit_new(page, upage, init, type, aux, type_init);
+
+		page->writable = writable;
 
 		/* TODO: Insert the page into the spt. */
 		/* TODO: 페이지를 보조 페이지 테이블에 삽입한다. */
