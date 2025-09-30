@@ -288,6 +288,13 @@ vm_claim_page (void *va UNUSED) {
 	return vm_do_claim_page (page);
 }
 
+void vm_free_frame(struct frame *frame) {
+	ASSERT(frame != NULL);
+	ASSERT(frame->page == NULL);
+	palloc_free_page(frame->kva);
+	free(frame);
+}
+
 /* Claim the PAGE and set up the mmu. */
 /* PAGE를 확보(claim)하고 MMU를 설정한다. */
 static bool
@@ -301,16 +308,21 @@ vm_do_claim_page (struct page *page) {
 
 	/* TODO: Insert page table entry to map page's VA to frame's PA. */
 	/* TODO: 페이지의 VA를 프레임의 PA에 매핑하는 페이지 테이블 엔트리를 삽입한다. */
-	if (!swap_in(page, frame->kva)) {
+	struct thread *cur = thread_current();
+	if (!pml4_set_page(cur->pml4, page->va, frame->kva, page->writable)) {
 		frame->page = NULL;
 		page->frame = NULL;
+		vm_free_frame(frame);
 		return false;
 	}
 
-	if (!pml4_set_page(thread_current()->pml4, page->va, frame->kva, page->writable)) {
+	if (!swap_in(page, frame->kva)) {
+		pml4_clear_page(cur->pml4, page->va);
+		frame->page = NULL;
+		page->frame = NULL;
+		vm_free_frame(frame);
 		return false;
 	}
-
 	return true;
 }
 

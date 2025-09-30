@@ -48,7 +48,9 @@
         "hash.h": "c",
         "vm.h": "c",
         "atomic": "c",
-        "uninit.h": "c"
+        "uninit.h": "c",
+        "anon.h": "c",
+        "inspect.h": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }
