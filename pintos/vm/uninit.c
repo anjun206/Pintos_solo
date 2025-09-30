@@ -44,6 +44,7 @@ uninit_new (struct page *page, void *va, vm_initializer *init,
 }
 
 /* Initalize the page on first fault */
+/* Initalize the page on first fault */
 static bool
 uninit_initialize (struct page *page, void *kva) {
 	struct uninit_page *uninit = &page->uninit;
@@ -52,23 +53,9 @@ uninit_initialize (struct page *page, void *kva) {
 	vm_initializer *init = uninit->init;
 	void *aux = uninit->aux;
 
-	// 1) 실제 타입 초기화자(anon/file)가 ops 세팅
-	if (!uninit->page_initializer(page, uninit->type, kva))
-		return false;
-
-	// 2) lazy 초기화자(lazy_load_segment) 호출 or 스택이면 zero-fill
-	bool ok = true;
-	if (init) {
-		ok = init(page, aux);     // lazy_load_segment가 aux free 하면 여기서 끝
-	} else {
-		memset(kva, 0, PGSIZE);   // 스택 같은 케이스: 첫 페이지는 0으로
-	}
-
-	// 3) 포인터 정리(초기화 1회성)
-	uninit->init = NULL;
-	uninit->aux  = NULL;
-
-	return ok;
+	/* TODO: You may need to fix this function. */
+	return uninit->page_initializer (page, uninit->type, kva) &&
+		(init ? init (page, aux) : true);
 }
 
 /* Free the resources hold by uninit_page. Although most of pages are transmuted
@@ -79,5 +66,9 @@ static void
 uninit_destroy (struct page *page) {
 	struct uninit_page *uninit UNUSED = &page->uninit;
 	/* TODO: Fill this function.
-	 * TODO: If you don't have anything to do, just return. */
+	 * TODO: If you don't have anything to do, just return. */\
+	if (uninit->aux) {
+		free(uninit->aux);
+		uninit->aux = NULL;
+	}
 }

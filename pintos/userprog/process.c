@@ -339,6 +339,8 @@ __do_fork (void *aux) {
 
 	process_activate (current);
 #ifdef VM
+	if (parent->exec_file)
+		current->exec_file = file_duplicate(parent->exec_file);
 	supplemental_page_table_init (&current->spt);
 	if (!supplemental_page_table_copy (&current->spt, &parent->spt))
 		goto error;

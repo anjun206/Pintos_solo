@@ -49,5 +49,13 @@ anon_swap_out (struct page *page) {
 /* Destroy the anonymous page. PAGE will be freed by the caller. */
 static void
 anon_destroy (struct page *page) {
-	// 미구현 3
+  struct anon_page *ap = &page->anon;
+  // 프레임 반납
+  if (page->frame) {
+    struct thread *cur = thread_current();
+    pml4_clear_page(cur->pml4, page->va);
+    page->frame->page = NULL;
+    vm_free_frame(page->frame);
+    page->frame = NULL;
+  }
 }

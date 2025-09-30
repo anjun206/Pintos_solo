@@ -8,6 +8,7 @@
 #include "vm/anon.h"
 #include "vm/file.h"
 #include "vm/uninit.h"
+#include <string.h>
 
 #define STACK_MAX_BYTES (1 << 20)  // 스택 성장 한계
 
@@ -335,8 +336,58 @@ supplemental_page_table_init (struct supplemental_page_table *spt UNUSED) {
 /* Copy supplemental page table from src to dst */
 /* 보조 페이지 테이블을 src에서 dst로 복사한다. */
 bool
-supplemental_page_table_copy (struct supplemental_page_table *dst UNUSED,
-		struct supplemental_page_table *src UNUSED) {
+supplemental_page_table_copy(struct supplemental_page_table *dst,
+                                  struct supplemental_page_table *src) {
+  struct hash_iterator it;
+  hash_first(&it, &src->h);
+  while (hash_next(&it)) {
+    struct page *sp = hash_entry(hash_cur(&it), struct page, spt_elem);
+    void *va = sp->va;
+    bool writable = sp->writable;
+
+    switch (page_get_type(sp)) {
+      case VM_ANON: {
+        if (!vm_alloc_page_with_initializer(VM_ANON, va, writable, NULL, NULL))
+          return false;
+        if (!vm_claim_page(va))
+          return false;
+
+        void *src_kva = sp->frame ? sp->frame->kva
+                                  : pml4_get_page(thread_current()->parent->pml4, va); // 상황에 맞게
+        void *dst_kva = pml4_get_page(thread_current()->pml4, va);
+        memcpy(dst_kva, src_kva, PGSIZE);
+        break;
+      }
+      case VM_UNINIT: {
+        enum vm_type utype = sp->uninit.type;       // VM_ANON or VM_FILE (지금 단계)
+        vm_initializer *init = sp->uninit.init;     // lazy_load_segment 등
+        void *aux_copy = NULL;
+
+        if (VM_TYPE(utype) == VM_FILE) {
+          // 부모 aux 깊은 복사 + file_reopen
+          // aux_copy = dup_file_aux(sp->uninit.aux); // 네가 만드는 함수
+        } else {
+          // 익명 지연이면 aux 없음 (또는 NULL 복사)
+        }
+
+        if (!vm_alloc_page_with_initializer(utype, va, writable, init, aux_copy))
+          return false;
+        if (!vm_claim_page(va))
+          return false;
+        break;
+      }
+      default:
+        return false;
+    }
+  }
+  return true;
+}
+
+
+static void destroy_and_free(struct hash_elem *e, void *aux) {
+  struct page *p = hash_entry(e, struct page, spt_elem);
+  p->operations->destroy(p);   // anon_destroy / uninit_destroy 등
+  free(p);
 }
 
 /* Free the resource hold by the supplemental page table */
@@ -347,4 +398,5 @@ supplemental_page_table_kill (struct supplemental_page_table *spt UNUSED) {
 	 * TODO: writeback all the modified contents to the storage. */
 	/* TODO: 쓰레드가 보유한 모든 보조 페이지 테이블을 파괴하고,
 	 * TODO: 수정된 내용을 저장소에 기록(writeback)한다. */
+	hash_destroy(&spt->h, destroy_and_free);
 }
