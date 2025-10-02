@@ -50,7 +50,9 @@
         "atomic": "c",
         "uninit.h": "c",
         "anon.h": "c",
-        "inspect.h": "c"
+        "inspect.h": "c",
+        "disk.h": "c",
+        "stddef.h": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }

@@ -170,10 +170,6 @@ process_create_initd (const char *file_name) {
 /* 첫 사용자 프로세스를 시작하는 스레드 함수. */
 static void
 initd (void *aux_) {
-#ifdef VM
-	supplemental_page_table_init (&thread_current ()->spt);
-#endif
-
 	process_init ();
 
 	struct exec_info *ei = aux_;
@@ -471,6 +467,10 @@ process_exec (void *f_name) {
 	_if.eflags = FLAG_IF | FLAG_MBS;
 
 	process_cleanup();
+
+#ifdef VM
+  	supplemental_page_table_init(&t->spt);
+#endif
 
 	/* 커맨드라인 토큰화: prog + argv[] */
 	char *save_ptr;
@@ -1174,6 +1174,7 @@ lazy_load_segment (struct page *page, void *aux_) {
 	if (aux->read_bytes > 0) {
 		int n = file_read_at(aux->file, kva, aux->read_bytes, aux->ofs);
 		if (n != (int)aux->read_bytes) {
+			file_close(aux->file);
 			free(aux);
 			return false;
 		}
@@ -1184,6 +1185,7 @@ lazy_load_segment (struct page *page, void *aux_) {
     	memset((uint8_t *)kva + aux->read_bytes, 0, aux->zero_bytes);
   	}
 	
+	file_close(aux->file);
 	free(aux);
 	return true;
 }
@@ -1234,7 +1236,8 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 		/* TODO: lazy_load_segment에 정보를 전달하기 위한 aux를 설정한다. */
 		struct load_aux *aux = malloc(sizeof *aux);
 		if (!aux) return false;
-		aux->file = file;
+		aux->file = file_reopen(file);
+		if (aux->file == NULL) { free(aux); return false; }
 		aux->ofs  = ofs;
 		aux->read_bytes = page_read_bytes;
 		aux->zero_bytes = page_zero_bytes;
@@ -1242,6 +1245,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 		/* 파일-백드 페이지로 lazy 등록 */
 		if (!vm_alloc_page_with_initializer(VM_FILE, upage, writable,
 											lazy_load_segment, aux)) {
+			file_close(aux->file); 
 			free(aux);
 			return false;
 		}

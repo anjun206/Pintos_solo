@@ -8,8 +8,20 @@
 #include "vm/anon.h"
 #include "vm/file.h"
 #include "vm/uninit.h"
+#include "filesys/file.h"
 
 #define STACK_MAX_BYTES (1 << 20)  // 스택 성장 한계
+
+
+#ifdef VM
+/* process.c의 struct load_aux와 동일한 레이아웃 (미러 선언) */
+struct load_aux {
+  struct file *file;
+  off_t ofs;
+  size_t read_bytes;
+  size_t zero_bytes;
+};
+#endif
 
 static uint64_t spt_hash(const struct hash_elem *e, void *aux) {
   const struct page *p = hash_entry(e, struct page, spt_elem);
@@ -20,6 +32,20 @@ static bool spt_less(const struct hash_elem *a, const struct hash_elem *b, void 
   const struct page *pa = hash_entry(a, struct page, spt_elem);
   const struct page *pb = hash_entry(b, struct page, spt_elem);
   return pa->va < pb->va;
+}
+
+/* UNINIT(FILE)용 aux deep-copy: 파일 핸들은 반드시 duplicate */
+static void *dup_aux_for_file_uninit(const void *aux0) {
+  if (aux0 == NULL) return NULL;
+  const struct load_aux *src = aux0;
+  struct load_aux *dst = malloc(sizeof *dst);
+  if (!dst) return NULL;
+  *dst = *src;
+  if (dst->file) {
+    dst->file = file_duplicate(dst->file);   /* 없으면 file_reopen(dst->file) 사용 */
+    if (!dst->file) { free(dst); return NULL; }
+  }
+  return dst;
 }
 
 /* Initializes the virtual memory subsystem by invoking each subsystem's
@@ -335,16 +361,77 @@ supplemental_page_table_init (struct supplemental_page_table *spt UNUSED) {
 /* Copy supplemental page table from src to dst */
 /* 보조 페이지 테이블을 src에서 dst로 복사한다. */
 bool
-supplemental_page_table_copy (struct supplemental_page_table *dst UNUSED,
-		struct supplemental_page_table *src UNUSED) {
+supplemental_page_table_copy (struct supplemental_page_table *dst,
+                              struct supplemental_page_table *src)
+{
+  struct hash_iterator it;
+  hash_first(&it, &src->h);
+
+  while (hash_next(&it)) {
+    struct page *sp = hash_entry(hash_cur(&it), struct page, spt_elem);
+    void *va = sp->va;
+    bool writable = sp->writable;
+
+    /* 현재 상태 */
+    enum vm_type cur = VM_TYPE(sp->operations->type);
+
+    if (cur == VM_UNINIT) {
+      /* 초기화되면 어떤 타입이 될지 (ANON/FILE) */
+      enum vm_type after = page_get_type(sp);
+      vm_initializer *init = sp->uninit.init;
+
+      void *aux_copy = NULL;
+      if (VM_TYPE(after) == VM_FILE) {
+        /* lazy_load_segment용 aux deep-copy (파일 핸들 duplicate) */
+		/* 나중에는 file_reaopen()하고 file_close()로 대체 권장 */
+        aux_copy = dup_aux_for_file_uninit(sp->uninit.aux);
+        if (sp->uninit.aux && aux_copy == NULL) goto fail;
+      } else {
+        /* 보통 UNINIT(ANON)은 aux가 없거나 의미 없음 */
+        aux_copy = NULL;
+      }
+
+      if (!vm_alloc_page_with_initializer(after, va, writable, init, aux_copy))
+        goto fail;
+
+      /* UNINIT은 여기서 끝. 자식은 첫 PF 때 로드됨. */
+      continue;
+    }
+
+    /* 이미 메모리에 올라온 페이지(ANON 또는 FILE) → 자식에 ANON 생성 후 내용 복사 */
+    if (!vm_alloc_page_with_initializer(VM_ANON, va, writable, NULL, NULL))
+      goto fail;
+    if (!vm_claim_page(va))
+      goto fail;
+
+    struct page *dp = spt_find_page(dst, va);
+    if (dp == NULL || dp->frame == NULL) goto fail;
+
+    /* 부모 페이지는 이미 메모리에 있어야 함 (swap 미구현 가정) */
+    if (sp->frame == NULL) goto fail;
+
+    memcpy(dp->frame->kva, sp->frame->kva, PGSIZE);
+  }
+
+  return true;
+
+fail:
+  /* 부분 생성된 dst 정리 */
+  supplemental_page_table_kill(dst);
+  return false;
+}
+
+
+/* 콜백 함수 */
+static void page_free_action(struct hash_elem *e, void *aux) {
+  struct page *p = hash_entry(e, struct page, spt_elem);
+  destroy(p);
+  free(p);
 }
 
 /* Free the resource hold by the supplemental page table */
 /* 보조 페이지 테이블이 보유한 리소스를 해제한다. */
 void
-supplemental_page_table_kill (struct supplemental_page_table *spt UNUSED) {
-	/* TODO: Destroy all the supplemental_page_table hold by thread and
-	 * TODO: writeback all the modified contents to the storage. */
-	/* TODO: 쓰레드가 보유한 모든 보조 페이지 테이블을 파괴하고,
-	 * TODO: 수정된 내용을 저장소에 기록(writeback)한다. */
+supplemental_page_table_kill(struct supplemental_page_table *spt) {
+	hash_destroy(&spt->h, page_free_action);
 }
