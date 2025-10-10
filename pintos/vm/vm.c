@@ -369,7 +369,7 @@ supplemental_page_table_copy (struct supplemental_page_table *dst,
 
   while (hash_next(&it)) {
     struct page *sp = hash_entry(hash_cur(&it), struct page, spt_elem);
-    void *va = sp->va;
+    void *va = pg_round_down(sp->va);
     bool writable = sp->writable;
 
     /* 현재 상태 */
@@ -377,32 +377,37 @@ supplemental_page_table_copy (struct supplemental_page_table *dst,
 
     if (cur == VM_UNINIT) {
       /* 초기화되면 어떤 타입이 될지 (ANON/FILE) */
-      enum vm_type after = page_get_type(sp);
-      vm_initializer *init = sp->uninit.init;
+		enum vm_type after = page_get_type(sp);
+		vm_initializer *init = sp->uninit.init;
 
-      void *aux_copy = NULL;
-      if (VM_TYPE(after) == VM_FILE) {
-        /* lazy_load_segment용 aux deep-copy (파일 핸들 duplicate) */
-		/* 나중에는 file_reaopen()하고 file_close()로 대체 권장 */
-        aux_copy = dup_aux_for_file_uninit(sp->uninit.aux);
-        if (sp->uninit.aux && aux_copy == NULL) goto fail;
-      } else {
-        /* 보통 UNINIT(ANON)은 aux가 없거나 의미 없음 */
-        aux_copy = NULL;
-      }
+		void *aux_copy = NULL;
+		if (VM_TYPE(after) == VM_FILE) {
+			/* lazy_load_segment용 aux deep-copy (파일 핸들 duplicate) */
+			/* 나중에는 file_reopen()하고 file_close()로 대체 권장 */
+			aux_copy = dup_aux_for_file_uninit(sp->uninit.aux);
+			if (sp->uninit.aux && aux_copy == NULL) goto fail;
+		} else {
+			/* 보통 UNINIT(ANON)은 aux가 없거나 의미 없음 */
+			aux_copy = NULL;
+		}
 
-      if (!vm_alloc_page_with_initializer(after, va, writable, init, aux_copy))
-        goto fail;
-
-      /* UNINIT은 여기서 끝. 자식은 첫 PF 때 로드됨. */
-      continue;
+		if (!vm_alloc_page_with_initializer(after, va, writable, init, aux_copy)) {
+			if (aux_copy) {
+				struct load_aux *ca = aux_copy;
+				if (ca->file) file_close(ca->file);
+			}
+			goto fail;
+		}
+		
+		/* UNINIT은 여기서 끝. 자식은 첫 PF 때 로드됨. */
+		continue;
     }
 
     /* 이미 메모리에 올라온 페이지(ANON 또는 FILE) → 자식에 ANON 생성 후 내용 복사 */
     if (!vm_alloc_page_with_initializer(VM_ANON, va, writable, NULL, NULL))
-      goto fail;
-    if (!vm_claim_page(va))
-      goto fail;
+		goto fail;
+	if (!vm_claim_page(va))
+		goto fail;
 
     struct page *dp = spt_find_page(dst, va);
     if (dp == NULL || dp->frame == NULL) goto fail;

@@ -98,32 +98,50 @@ kmap_user_addr_or_claim(const void *uaddr, bool for_write) {
   void *upg = pg_round_down(uaddr);
   void *kp = pml4_get_page(t->pml4, upg);
 
-  /* 커널 주소 없을때 */
-  if (kp == NULL) {
-    struct page *p = spt_find_page(&t->spt, upg);
-    if (p == NULL) {
-      /* 스택 성장: USER_STACK 한도 내에서 */
-      if ((uintptr_t)upg < (uintptr_t)USER_STACK &&
-          (uintptr_t)USER_STACK - (uintptr_t)upg <= STACK_MAX_BYTES) {
-        if (!vm_alloc_page(VM_ANON | VM_MARKER_0, upg, true))
-          system_exit(-1);
-        p = spt_find_page(&t->spt, upg);
-        if (p == NULL) system_exit(-1);
-      } else {
-        system_exit(-1);
-      }
-    }
-    if (for_write && !p->writable) system_exit(-1);
-    if (!vm_claim_page(upg)) system_exit(-1);
-    kp = pml4_get_page(t->pml4, upg);
-    if (kp == NULL) system_exit(-1);
-  } else {
-    /* SPT가 read-only이면 탈락 */
+  if (kp != NULL) {
+    // 매핑은 있는데 SPT상 read-only면 쓰기 금지
     struct page *p = spt_find_page(&t->spt, upg);
     if (for_write && p && !p->writable) system_exit(-1);
+    return (uint8_t *)kp + pg_ofs(uaddr);
   }
 
+  // 커널 경로에서는 "이미 SPT에 등록된 페이지"만 가져온다.
+  struct page *p = spt_find_page(&t->spt, upg);
+  if (p == NULL) system_exit(-1);                 // 스택 새로 만들지 말고 즉시 종료
+  if (for_write && !p->writable) system_exit(-1);
+
+  if (!vm_claim_page(upg)) system_exit(-1);
+
+  kp = pml4_get_page(t->pml4, upg);
+  if (kp == NULL) system_exit(-1);
   return (uint8_t *)kp + pg_ofs(uaddr);
+
+  // /* 커널 주소 없을때 */
+  // if (kp == NULL) {
+  //   struct page *p = spt_find_page(&t->spt, upg);
+  //   if (p == NULL) {
+  //     /* 스택 성장: USER_STACK 한도 내에서 */
+  //     if ((uintptr_t)upg < (uintptr_t)USER_STACK &&
+  //         (uintptr_t)USER_STACK - (uintptr_t)upg <= STACK_MAX_BYTES) {
+  //       if (!vm_alloc_page(VM_ANON | VM_MARKER_0, upg, true))
+  //         system_exit(-1);
+  //       p = spt_find_page(&t->spt, upg);
+  //       if (p == NULL) system_exit(-1);
+  //     } else {
+  //       system_exit(-1);
+  //     }
+  //   }
+  //   if (for_write && !p->writable) system_exit(-1);
+  //   if (!vm_claim_page(upg)) system_exit(-1);
+  //   kp = pml4_get_page(t->pml4, upg);
+  //   if (kp == NULL) system_exit(-1);
+  // } else {
+  //   /* SPT가 read-only이면 탈락 */
+  //   struct page *p = spt_find_page(&t->spt, upg);
+  //   if (for_write && p && !p->writable) system_exit(-1);
+  // }
+
+  // return (uint8_t *)kp + pg_ofs(uaddr);
 }
 #endif
 
@@ -188,6 +206,7 @@ syscall_init (void) {
 /* 주요 시스템 콜 인터페이스 */
 /* 개쩌는 가시성 (아님) */
 void syscall_handler(struct intr_frame *f) {
+  thread_current()->user_rsp = f->rsp;
   switch (SC_NO(f)) {
     case SYS_HALT:   system_halt(); __builtin_unreachable();
     case SYS_EXIT:   system_exit((int)ARG0(f)); __builtin_unreachable();

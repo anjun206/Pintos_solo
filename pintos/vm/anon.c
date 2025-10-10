@@ -9,7 +9,6 @@
 #include "threads/mmu.h"
 
 /* DO NOT MODIFY BELOW LINE */
-static struct disk *swap_disk;
 static bool anon_swap_in (struct page *page, void *kva);
 static bool anon_swap_out (struct page *page);
 static void anon_destroy (struct page *page);
@@ -71,25 +70,25 @@ anon_swap_out (struct page *page) {
 
 /* Destroy the anonymous page. PAGE will be freed by the caller. */
 static void anon_destroy(struct page *page) {
-  struct anon_page *ap = &page->anon;
+	struct anon_page *ap = &page->anon;
 
-  /* 1) 스왑 슬롯 해제: 프레임 유무와 무관하게, 슬롯이 있으면 해제 */
-  if (ap->slot_idx != SIZE_MAX) {
-	lock_acquire(&swap_lock);
-    bitmap_reset(swap_table, ap->slot_idx);
-	lock_release(&swap_lock);
-    ap->slot_idx = SIZE_MAX;
-  }
+	/* 1) 스왑 슬롯 해제: 프레임 유무와 무관하게, 슬롯이 있으면 해제 */
+	if (ap->slot_idx != SIZE_MAX) {
+		lock_acquire(&swap_lock);
+		bitmap_reset(swap_table, ap->slot_idx);
+		lock_release(&swap_lock);
+		ap->slot_idx = SIZE_MAX;
+	}
 
-  /* 2) 프레임 반납: 매핑 해제 → 연결 해제 → 프레임 free */
-  if (page->frame != NULL) {
-    struct thread *cur = thread_current();
-    if (pml4_get_page(cur->pml4, page->va) != NULL) {
-      pml4_clear_page(cur->pml4, page->va);
-    }
+	/* 2) 프레임 반납: 매핑 해제 → 연결 해제 → 프레임 free */
+	if (page->frame != NULL) {
+		struct thread *cur = thread_current();
+		if (pml4_get_page(cur->pml4, page->va) != NULL) {
+		pml4_clear_page(cur->pml4, page->va);
+		}
 
-    page->frame->page = NULL;
-    vm_free_frame(page->frame);
-    page->frame = NULL;
-  }
+		page->frame->page = NULL;
+		vm_free_frame(page->frame);
+		page->frame = NULL;
+	}
 }
