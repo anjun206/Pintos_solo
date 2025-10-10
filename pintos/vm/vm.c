@@ -265,15 +265,18 @@ vm_try_handle_fault (struct intr_frame *f, void *addr,
 		return vm_do_claim_page(page);
 	}
 
-	/* TODO: Your code goes here */
-	/* TODO: 여기에 코드를 작성하라. */
+	// ===== Stack growth heuristic =====
+	// rsp 기준: user PF이면 f->rsp, kernel PF이면 저장된 user_rsp 사용
+	uintptr_t saved_rsp = (uintptr_t)(user ? f->rsp : thread_current()->user_rsp);
 
-	// rsp 기준값: user PF면 f->rsp, kernel PF면 저장해둔 user_rsp 사용
-	uintptr_t rsp_base = (uintptr_t)(user ? f->rsp : thread_current()->user_rsp);
-	bool within_limit  = (uintptr_t)USER_STACK - (uintptr_t)uva <= (uintptr_t)STACK_MAX_BYTES;
-	bool near_rsp      = (uintptr_t)addr >= (rsp_base - 32) && (uintptr_t)addr < (uintptr_t)USER_STACK;
+	// 커널 PF인데 saved_rsp가 아직 세팅 안 됐다면(=0), 확장 금지
+	if (!user && saved_rsp == 0) return false;
 
+	uintptr_t ubound = (uintptr_t)USER_STACK;
+	bool within_limit = ubound - (uintptr_t)uva <= (uintptr_t)STACK_MAX_BYTES;
+	bool near_rsp     = (uintptr_t)addr >= (saved_rsp - 32) && (uintptr_t)addr < ubound;
 
+	
 	// 쓰기 fault + rsp 근처 + 한도 이내만 허용
 	if (write && within_limit && near_rsp) {
 		if (!vm_alloc_page(VM_ANON | VM_MARKER_0, uva, true)) return false;
