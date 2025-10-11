@@ -47,8 +47,10 @@ void syscall_handler (struct intr_frame *);
 #define STDOUT_FD ((struct file*)-2)
 
 #ifdef VM
-#define STACK_MAX_BYTES (1 << 20)  /* 1 MiB 스택 최대 성장 폭 */
+#define STACK_MAX_BYTES   (1u << 20)  /* 1 MiB */
+#define STACK_GROW_SLACK  64          /* RSP 근처 허용 여유 */
 #endif
+
 
 
 /* 프로토 타입 */
@@ -89,59 +91,54 @@ static struct file_ref *ref_find(struct file *fp);
 
 /* vm 헬퍼 */
 #ifdef VM
-/* lazy 할당 시도 하는 함수 */
 static uint8_t *
 kmap_user_addr_or_claim(const void *uaddr, bool for_write) {
   struct thread *t = thread_current();
   if (uaddr == NULL || !is_user_vaddr(uaddr)) system_exit(-1);
 
   void *upg = pg_round_down(uaddr);
-  void *kp = pml4_get_page(t->pml4, upg);
 
+  /* 1) 이미 매핑되어 있으면 그대로 반환 */
+  void *kp = pml4_get_page(t->pml4, upg);
   if (kp != NULL) {
-    // 매핑은 있는데 SPT상 read-only면 쓰기 금지
     struct page *p = spt_find_page(&t->spt, upg);
     if (for_write && p && !p->writable) system_exit(-1);
     return (uint8_t *)kp + pg_ofs(uaddr);
   }
 
-  // 커널 경로에서는 "이미 SPT에 등록된 페이지"만 가져온다.
+  /* 2) SPT에 등록된 페이지면 claim해서 매핑 */
   struct page *p = spt_find_page(&t->spt, upg);
-  if (p == NULL) system_exit(-1);                 // 스택 새로 만들지 말고 즉시 종료
-  if (for_write && !p->writable) system_exit(-1);
+  if (p != NULL) {
+    if (for_write && !p->writable) system_exit(-1);
+    if (!vm_claim_page(upg)) system_exit(-1);
+    kp = pml4_get_page(t->pml4, upg);
+    if (kp == NULL) system_exit(-1);
+    return (uint8_t *)kp + pg_ofs(uaddr);
+  }
 
-  if (!vm_claim_page(upg)) system_exit(-1);
+  /* 3) (핵심) 스택 성장 허용: 쓰기 상황 + 스택 창 + RSP 근처 */
+  uintptr_t ua     = (uintptr_t)uaddr;
+  uintptr_t upg_a  = (uintptr_t)upg;
+  uintptr_t rsp    = (uintptr_t)t->user_rsp;
 
-  kp = pml4_get_page(t->pml4, upg);
-  if (kp == NULL) system_exit(-1);
-  return (uint8_t *)kp + pg_ofs(uaddr);
+  bool in_stack_window =
+      upg_a >= (uintptr_t)USER_STACK - (uintptr_t)STACK_MAX_BYTES &&
+      upg_a <  (uintptr_t)USER_STACK;
 
-  // /* 커널 주소 없을때 */
-  // if (kp == NULL) {
-  //   struct page *p = spt_find_page(&t->spt, upg);
-  //   if (p == NULL) {
-  //     /* 스택 성장: USER_STACK 한도 내에서 */
-  //     if ((uintptr_t)upg < (uintptr_t)USER_STACK &&
-  //         (uintptr_t)USER_STACK - (uintptr_t)upg <= STACK_MAX_BYTES) {
-  //       if (!vm_alloc_page(VM_ANON | VM_MARKER_0, upg, true))
-  //         system_exit(-1);
-  //       p = spt_find_page(&t->spt, upg);
-  //       if (p == NULL) system_exit(-1);
-  //     } else {
-  //       system_exit(-1);
-  //     }
-  //   }
-  //   if (for_write && !p->writable) system_exit(-1);
-  //   if (!vm_claim_page(upg)) system_exit(-1);
-  //   kp = pml4_get_page(t->pml4, upg);
-  //   if (kp == NULL) system_exit(-1);
-  // } else {
-  //   /* SPT가 read-only이면 탈락 */
-  //   struct page *p = spt_find_page(&t->spt, upg);
-  //   if (for_write && p && !p->writable) system_exit(-1);
-  // }
+  bool near_rsp =
+      (ua + 8) >= (rsp - STACK_GROW_SLACK) && ua < (uintptr_t)USER_STACK;
 
-  // return (uint8_t *)kp + pg_ofs(uaddr);
+  if (for_write && in_stack_window && near_rsp) {
+    if (!vm_alloc_page(VM_ANON | VM_MARKER_0, upg, true)) system_exit(-1);
+    if (!vm_claim_page(upg)) system_exit(-1);
+    kp = pml4_get_page(t->pml4, upg);
+    if (kp == NULL) system_exit(-1);
+    return (uint8_t *)kp + pg_ofs(uaddr);
+  }
+
+  /* 스택 후보가 아니거나, RSP에서 너무 멀면 잘못된 접근 */
+  system_exit(-1);
+  __builtin_unreachable();
 }
 #endif
 
