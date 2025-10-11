@@ -147,12 +147,22 @@ page_fault (struct intr_frame *f) {
 	/* Count page faults. */
 	page_fault_cnt++;
 
+	// 조용히 종료: 유저 모드거나, 커널 모드라도 "유저 주소" 잘못이면 -1 종료
+	if (user || is_user_vaddr(fault_addr)) {
+		system_exit(-1);
+		__builtin_unreachable();
+	}
+
+	// 커널 영역 잘못이면 커널 버그
+	intr_dump_frame (f);
+	PANIC ("Kernel bug - unexpected page fault in kernel");
+
 	/* If the fault is true fault, show info and exit. */
-	printf ("Page fault at %p: %s error %s page in %s context.\n",
-			fault_addr,
-			not_present ? "not present" : "rights violation",
-			write ? "writing" : "reading",
-			user ? "user" : "kernel");
-	kill (f);
+	// printf ("Page fault at %p: %s error %s page in %s context.\n",
+	// 		fault_addr,
+	// 		not_present ? "not present" : "rights violation",
+	// 		write ? "writing" : "reading",
+	// 		user ? "user" : "kernel");
+	// kill (f);
 }
 

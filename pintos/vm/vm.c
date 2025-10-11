@@ -203,8 +203,13 @@ vm_evict_frame (void) {
 	struct frame *victim UNUSED = vm_get_victim ();
 	/* TODO: swap out the victim and return the evicted frame. */
 	/* TODO: victim을 스왑 아웃하고 제거된 프레임을 반환한다. */
+	struct page  *p = vict->page;
+	ASSERT(p);
 
-	return NULL;
+	if (!swap_out(p)) return NULL;                      // p->operations->swap_out
+	// 이제 vict는 비어 있음
+	vict->page = NULL;
+	return vict;                                        // kva 재사용
 }
 
 /* palloc() and get frame. If there is no available page, evict the page
@@ -220,7 +225,8 @@ vm_get_frame (void) {
 	void *kva = palloc_get_page(PAL_USER);
 
 	// oom시 아직은 패닉으로 처리 나중에 evict로 대체
-	if (kva == NULL) PANIC("vm get frame 실패");
+	// evict으로 대체다 시봉방거
+	if (kva == NULL) return vm_evict_frame();
 
 	struct frame *frame = malloc(sizeof *frame);
 	/* TODO: Fill this function. */
@@ -233,11 +239,40 @@ vm_get_frame (void) {
 	return frame;
 }
 
-/* Growing the stack. */
-/* 스택을 확장한다. */
-static void
-vm_stack_growth (void *addr UNUSED) {
+
+/* fault_addr가 스택 접근처럼 보이는지 판단: RSP 바로 아래(푸시 여유 8B)에서만 허용 */
+static inline bool
+looks_like_stack_access(void *fault_addr, void *user_rsp) {
+  return fault_addr >= (uint8_t *)user_rsp - 8 && fault_addr < (void *)USER_STACK;
 }
+
+/* 스택 성장: fault_addr 쪽 페이지 하나를 demand-zero로 키운다. */
+bool
+vm_stack_growth(void *fault_addr, void *user_rsp) {
+  /* 사용자 주소, RSP 인접성, 상한(1MiB) 체크 */
+  if (!is_user_vaddr(fault_addr)) return false;
+
+  void *page = pg_round_down(fault_addr);
+  uintptr_t bytes_from_top = (uintptr_t)USER_STACK - (uintptr_t)page;
+  if (bytes_from_top > STACK_MAX_BYTES) return false;
+  if (!looks_like_stack_access(fault_addr, user_rsp)) return false;
+
+  struct thread *t = thread_current();
+
+  /* 이미 매핑돼 있으면 끝 */
+  if (spt_find_page(&t->spt, page)) return true;
+
+  /* 한 페이지만 키운다(큰 alloca/배열은 페이지 폴트가 연쇄로 오며 한 장씩 채움) */
+  if (!vm_alloc_page(VM_ANON, page, true)) return false;
+  if (!vm_claim_page(page)) {
+    /* claim 실패 시 SPT에 남은 엔트리 정리(구현체에 맞게 정리) */
+    struct page *p = spt_find_page(&t->spt, page);
+    if (p) vm_dealloc_page(p);
+    return false;
+  }
+  return true;
+}
+
 
 /* Handle the fault on write_protected page */
 /* 쓰기 보호된 페이지에서 발생한 페이지 폴트를 처리한다. */
@@ -252,6 +287,7 @@ vm_try_handle_fault (struct intr_frame *f, void *addr,
 		bool user, bool write, bool not_present) {
 	if (!not_present) return false;
 	if (!is_user_vaddr(addr) || addr == NULL) return false;
+	if ((uintptr_t)addr >= (uintptr_t)USER_STACK) return false;
 
 	/* TODO: Validate the fault */
 	/* TODO: 페이지 폴트를 검증한다. */
@@ -278,11 +314,16 @@ vm_try_handle_fault (struct intr_frame *f, void *addr,
 
 	
 	// 쓰기 fault + rsp 근처 + 한도 이내만 허용
-	if (write && within_limit && near_rsp) {
-		if (!vm_alloc_page(VM_ANON | VM_MARKER_0, uva, true)) return false;
-		return vm_claim_page(uva);
+	if (write && near_rsp && within_limit) {
+		if (!vm_alloc_page(VM_ANON /* | VM_MARKER_0 */, uva, true)) return false;
+		if (!vm_claim_page(uva)) {
+			// claim 실패 정리
+			struct page *p = spt_find_page(&thread_current()->spt, uva);
+			if (p) vm_dealloc_page(p);
+			return false;
+		}
+		return true;
 	}
-
 	// if (user) {
 	// 	/* 현재 사용자 스택 포인터 */
 	// 	void *rsp = (void *)f->rsp;
