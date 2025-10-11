@@ -200,16 +200,9 @@ vm_get_victim (void) {
  * 오류 시 NULL을 반환한다. */
 static struct frame *
 vm_evict_frame (void) {
-	struct frame *victim UNUSED = vm_get_victim ();
 	/* TODO: swap out the victim and return the evicted frame. */
 	/* TODO: victim을 스왑 아웃하고 제거된 프레임을 반환한다. */
-	struct page  *p = vict->page;
-	ASSERT(p);
-
-	if (!swap_out(p)) return NULL;                      // p->operations->swap_out
-	// 이제 vict는 비어 있음
-	vict->page = NULL;
-	return vict;                                        // kva 재사용
+	PANIC("eviction not implemented");
 }
 
 /* palloc() and get frame. If there is no available page, evict the page
@@ -222,21 +215,13 @@ vm_evict_frame (void) {
  * 즉, 사용자 풀 메모리가 가득 찼을 경우 이 함수는 프레임을 제거해 가용 메모리를 확보한다. */
 static struct frame *
 vm_get_frame (void) {
-	void *kva = palloc_get_page(PAL_USER);
-
-	// oom시 아직은 패닉으로 처리 나중에 evict로 대체
-	// evict으로 대체다 시봉방거
-	if (kva == NULL) return vm_evict_frame();
-
-	struct frame *frame = malloc(sizeof *frame);
-	/* TODO: Fill this function. */
-	/* TODO: 이 함수를 구현하라. */
-
-	ASSERT (frame != NULL);
-	frame->kva = kva;
-	frame->page = NULL;
-	// 나중에 프레임에 추가 기능
-	return frame;
+  void *kva = palloc_get_page(PAL_USER);
+  if (kva == NULL) PANIC("Out of user pages (no eviction)");
+  struct frame *frame = malloc(sizeof *frame);
+  ASSERT (frame != NULL);
+  frame->kva = kva;
+  frame->page = NULL;
+  return frame;
 }
 
 
@@ -310,7 +295,7 @@ vm_try_handle_fault (struct intr_frame *f, void *addr,
 
 	uintptr_t ubound = (uintptr_t)USER_STACK;
 	bool within_limit = ubound - (uintptr_t)uva <= (uintptr_t)STACK_MAX_BYTES;
-	bool near_rsp     = (uintptr_t)addr >= (saved_rsp - 32) && (uintptr_t)addr < ubound;
+	bool near_rsp     = (uintptr_t)addr >= (saved_rsp - 8) && (uintptr_t)addr < ubound;
 
 	
 	// 쓰기 fault + rsp 근처 + 한도 이내만 허용
@@ -429,56 +414,71 @@ supplemental_page_table_copy (struct supplemental_page_table *dst,
     void *va = pg_round_down(sp->va);
     bool writable = sp->writable;
 
-    /* 현재 상태 */
     enum vm_type cur = VM_TYPE(sp->operations->type);
 
     if (cur == VM_UNINIT) {
-      /* 초기화되면 어떤 타입이 될지 (ANON/FILE) */
-		enum vm_type after = page_get_type(sp);
-		vm_initializer *init = sp->uninit.init;
+      enum vm_type after = page_get_type(sp);
+      vm_initializer *init = sp->uninit.init;
 
-		void *aux_copy = NULL;
-		if (VM_TYPE(after) == VM_FILE) {
-			/* lazy_load_segment용 aux deep-copy (파일 핸들 duplicate) */
-			/* 나중에는 file_reopen()하고 file_close()로 대체 권장 */
-			aux_copy = dup_aux_for_file_uninit(sp->uninit.aux);
-			if (sp->uninit.aux && aux_copy == NULL) goto fail;
-		} else {
-			/* 보통 UNINIT(ANON)은 aux가 없거나 의미 없음 */
-			aux_copy = NULL;
-		}
+      void *aux_copy = NULL;
+      if (VM_TYPE(after) == VM_FILE) {
+        aux_copy = dup_aux_for_file_uninit(sp->uninit.aux);
+        if (sp->uninit.aux && aux_copy == NULL) goto fail;
+      }
 
-		if (!vm_alloc_page_with_initializer(after, va, writable, init, aux_copy)) {
-			if (aux_copy) {
-				struct load_aux *ca = aux_copy;
-				if (ca->file) file_close(ca->file);
-			}
-			goto fail;
-		}
-		
-		/* UNINIT은 여기서 끝. 자식은 첫 PF 때 로드됨. */
-		continue;
+      if (!vm_alloc_page_with_initializer(after, va, writable, init, aux_copy)) {
+        if (aux_copy) { struct load_aux *ca = aux_copy; if (ca->file) file_close(ca->file); }
+        goto fail;
+      }
+      continue;
     }
 
-    /* 이미 메모리에 올라온 페이지(ANON 또는 FILE) → 자식에 ANON 생성 후 내용 복사 */
-    if (!vm_alloc_page_with_initializer(VM_ANON, va, writable, NULL, NULL))
-		goto fail;
-	if (!vm_claim_page(va))
-		goto fail;
+    if (cur == VM_FILE) {
+      /* 부모가 이미 로드한 FILE 페이지 → 자식은 다시 UNINIT(FILE)로 등록
+         (게으른 로드 유지로 메모리 폭증 방지) */
+      struct load_aux *aux = malloc(sizeof *aux);
+      if (!aux) goto fail;
+
+      /* 부모 page->file 메타에서 aux 재구성 (file duplicate) */
+      aux->ofs        = sp->file.ofs;
+      aux->read_bytes = sp->file.read_bytes;
+      aux->zero_bytes = sp->file.zero_bytes;
+      aux->file       = file_duplicate(sp->file.file);
+      if (!aux->file) { free(aux); goto fail; }
+
+      if (!vm_alloc_page_with_initializer(VM_FILE, va, writable,
+                                          /*init=*/NULL, /*aux=*/NULL)) {
+        file_close(aux->file); free(aux); goto fail;
+      }
+      /* UNINIT에 aux를 안 쓰는 설계이므로, 자식 page->file에 바로 주입 */
+      struct page *dp = spt_find_page(dst, va);
+      ASSERT(dp != NULL);
+      dp->file.file       = aux->file;
+      dp->file.ofs        = aux->ofs;
+      dp->file.read_bytes = aux->read_bytes;
+      dp->file.zero_bytes = aux->zero_bytes;
+      dp->file.is_mmap    = false; /* exec 로드 영역 */
+      dp->file.is_head    = false;
+      dp->file.npages     = 0;
+      free(aux);
+
+      /* 클레임하지 않음 (첫 PF 때 로드) */
+      continue;
+    }
+
+    /* ANON은 깊은 복사 */
+    if (!vm_alloc_page_with_initializer(VM_ANON, va, writable, NULL, NULL)) goto fail;
+    if (!vm_claim_page(va)) goto fail;
 
     struct page *dp = spt_find_page(dst, va);
     if (dp == NULL || dp->frame == NULL) goto fail;
-
-    /* 부모 페이지는 이미 메모리에 있어야 함 (swap 미구현 가정) */
     if (sp->frame == NULL) goto fail;
 
     memcpy(dp->frame->kva, sp->frame->kva, PGSIZE);
   }
 
   return true;
-
 fail:
-  /* 부분 생성된 dst 정리 */
   supplemental_page_table_kill(dst);
   return false;
 }

@@ -21,6 +21,7 @@
 #include "lib/kernel/hash.h"
 #ifdef VM
 #include "vm/vm.h"
+#include "vm/file.h"
 #endif
 
 
@@ -74,6 +75,9 @@ static void system_seek(int fd, unsigned position);
 static unsigned system_tell(int fd);
 
 static int system_dup2(int oldfd, int newfd);
+
+static void system_munmap(void *addr);
+static void *system_mmap(int fd, void *addr);
 
 /* 시스템콜 헬퍼 */
 static struct file *fd_get(int fd);
@@ -202,6 +206,23 @@ syscall_init (void) {
   hash_init(&file_ref_ht, file_ref_hash, file_ref_less, NULL);
 }
 
+#ifdef VM
+static void *system_mmap(int fd, void *addr) {
+  struct file *f = fd_get(fd);
+  if (!f || f == STDIN_FD || f == STDOUT_FD) return NULL;
+  if (addr == NULL || pg_ofs(addr) != 0) return NULL;
+
+  lock_acquire(&filesys_lock);
+  off_t len = file_length(f);
+  lock_release(&filesys_lock);
+  if (len <= 0) return NULL;
+
+  return do_mmap(addr, (size_t)len, /*writable=*/true, f, /*offset=*/0);
+}
+
+static void system_munmap(void *addr) { if (addr) do_munmap(addr); }
+#endif
+
 /* The main system call interface */
 /* 주요 시스템 콜 인터페이스 */
 /* 개쩌는 가시성 (아님) */
@@ -232,6 +253,11 @@ void syscall_handler(struct intr_frame *f) {
 
     /* dup2 extra 과제 */
     case SYS_DUP2:   RET(f, system_dup2((int)ARG0(f), (int)ARG1(f))); break;
+
+    #ifdef VM
+    case SYS_MMAP:   RET(f, (uint64_t)system_mmap((int)ARG0(f), (void*)ARG1(f))); break;
+    case SYS_MUNMAP: system_munmap((void*)ARG0(f)); break;
+    #endif
 
     default:         system_exit(-1); __builtin_unreachable();
   }
@@ -520,28 +546,54 @@ assert_user_range(const void *uaddr, size_t size) {
   }
 }
 
+#ifdef VM
+/* 사용자 주소를 KVA로 보장. 필요 시 lazy-claim, (쓰기 && RSP-8 근처)면 스택성장 허용. */
+static inline uint8_t *
+ensure_user_kva(const void *u, bool write) {
+  struct thread *t = thread_current();
+  if (u == NULL || !is_user_vaddr(u)) system_exit(-1);
+
+  void *pg = pg_round_down(u);
+  void *kva = pml4_get_page(t->pml4, pg);
+
+  if (kva == NULL) {
+    /* 1) 먼저 lazy/file-backed 클레임 시도 */
+    if (!vm_claim_page(pg)) {
+      /* 2) 실패면, (쓰기 && RSP-8 근처 && 1MiB 이내)일 때만 스택 성장 허용 */
+      uintptr_t saved_rsp = (uintptr_t)t->user_rsp;
+      bool near_rsp = (uintptr_t)u >= saved_rsp - 8 && (uintptr_t)u < (uintptr_t)USER_STACK;
+      bool within = (uintptr_t)USER_STACK - (uintptr_t)pg <= (uintptr_t)STACK_MAX_BYTES;
+      if (!(write && near_rsp && within)) system_exit(-1);
+      if (!vm_stack_growth((void *)u, (void *)saved_rsp)) system_exit(-1);
+    }
+    kva = pml4_get_page(t->pml4, pg);
+    if (kva == NULL) system_exit(-1);
+  }
+
+  /* 쓰기 시, 실제로 writable 매핑인지 반드시 확인 */
+  if (write) {
+    struct page *p = spt_find_page(&t->spt, pg);
+    if (p == NULL || !p->writable) system_exit(-1);
+  }
+
+  return (uint8_t *)kva + pg_ofs(u);
+}
+#endif
+
 static bool
 copy_in_string(char *kdst, const char *usrc, size_t max_len) {
 #ifdef VM
-  // 커널 주소로 넘어오면 위험: 즉시 종료
   if (usrc == NULL || !is_user_vaddr(usrc)) system_exit(-1);
-
-  for (size_t i = 0; i < max_len; i++) {
-    // 유저 주소 직접 접근 → 미매핑/RO면 커널 #PF 발생 → 핸들러에서 처리
-    // 경계 넘어 커널 영역에 닿을 수도 있으니, 매번 가드
-    const uint8_t *u = (const uint8_t *)usrc + i;
-    if (!is_user_vaddr(u)) system_exit(-1);
-
-    char c = *(volatile const char *)u;
-    kdst[i] = c;
+  size_t i = 0;
+  while (i < max_len) {
+    uint8_t *kp = ensure_user_kva(usrc + i, false);
+    char c = *(char *)kp;
+    kdst[i++] = c;
     if (c == '\0') return true;
   }
-
-  // NUL을 못 만나면 false
   kdst[max_len - 1] = '\0';
   return false;
-
-#else  // !VM
+#else
 
   if (usrc == NULL || !is_user_vaddr(usrc)) system_exit(-1);
 
@@ -567,17 +619,16 @@ copy_in_string(char *kdst, const char *usrc, size_t max_len) {
 static void
 copy_in(void *kdst, const void *usrc, size_t n) {
 #ifdef VM
-  if (usrc == NULL || !is_user_vaddr(usrc)) system_exit(-1);
-
   uint8_t *kd = (uint8_t *)kdst;
   const uint8_t *u = (const uint8_t *)usrc;
-
-  while (n-- > 0) {
-    if (!is_user_vaddr(u)) system_exit(-1);              // 매바이트 가드
-    *kd++ = *(volatile const uint8_t *)u++;              // PF 유도
+  while (n > 0) {
+    uint8_t *base = ensure_user_kva(u, false) - pg_ofs(u);
+    size_t chunk = PGSIZE - pg_ofs(u);
+    if (chunk > n) chunk = n;
+    memcpy(kd, base + pg_ofs(u), chunk);
+    kd += chunk; u += chunk; n -= chunk;
   }
-
-#else  // !VM
+#else
 
   uint8_t *kd = (uint8_t *)kdst;
   const uint8_t *u = (const uint8_t *)usrc;
@@ -602,17 +653,16 @@ copy_in(void *kdst, const void *usrc, size_t n) {
 static void
 copy_out(void *udst, const void *ksrc, size_t n) {
 #ifdef VM
-  if (udst == NULL || !is_user_vaddr(udst)) system_exit(-1);
-
   uint8_t *u = (uint8_t *)udst;
   const uint8_t *k = (const uint8_t *)ksrc;
-
-  while (n-- > 0) {
-    if (!is_user_vaddr(u)) system_exit(-1);              // 매바이트 가드
-    *(volatile uint8_t *)u++ = *k++;                     // PF 유도 (write)
+  while (n > 0) {
+    uint8_t *base = ensure_user_kva(u, true) - pg_ofs(u);   // ★ write=true → RO면 exit(-1)
+    size_t chunk = PGSIZE - pg_ofs(u);
+    if (chunk > n) chunk = n;
+    memcpy(base + pg_ofs(u), k, chunk);
+    u += chunk; k += chunk; n -= chunk;
   }
-
-#else  // !VM
+#else
 
   uint8_t *u = (uint8_t *)udst;
   const uint8_t *k = (const uint8_t *)ksrc;
