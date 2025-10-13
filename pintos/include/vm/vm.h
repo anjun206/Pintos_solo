@@ -95,7 +95,9 @@ struct supplemental_page_table {
 #include "threads/thread.h"
 void supplemental_page_table_init (struct supplemental_page_table *spt);
 bool supplemental_page_table_copy (struct supplemental_page_table *dst,
-		struct supplemental_page_table *src);
+                                   struct supplemental_page_table *src,
+                                   struct file *parent_exec_file,
+                                   struct file *child_exec_file);
 void supplemental_page_table_kill (struct supplemental_page_table *spt);
 struct page *spt_find_page (struct supplemental_page_table *spt,
 		void *va);

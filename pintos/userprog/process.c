@@ -27,6 +27,8 @@
 #include "vm/vm.h"
 #endif
 
+extern struct lock filesys_lock;
+
 static void process_cleanup (void);
 static bool load (const char *file_name, struct intr_frame *if_);
 static void initd (void *f_name);
@@ -336,9 +338,10 @@ __do_fork (void *aux) {
 	process_activate (current);
 #ifdef VM
 	supplemental_page_table_init (&current->spt);
-	if (parent->exec_file)
-		current->exec_file = file_duplicate(parent->exec_file);
-	if (!supplemental_page_table_copy (&current->spt, &parent->spt))
+    if (parent->exec_file)
+      current->exec_file = file_duplicate(parent->exec_file);
+    if (!supplemental_page_table_copy (&current->spt, &parent->spt,
+                                       parent->exec_file, current->exec_file))
 		goto error;
 #else
 	if (!pml4_for_each (parent->pml4, duplicate_pte, parent))
@@ -853,7 +856,9 @@ load (const char *file_name, struct intr_frame *if_) {
 
 	/* Open executable file. */
 	/* 실행 파일을 연다. */
+	lock_acquire(&filesys_lock);
 	file = filesys_open (file_name);
+	lock_release(&filesys_lock);
 	if (file == NULL) {
 		printf ("load: %s: open failed\n", file_name);
 		goto done;
@@ -861,6 +866,7 @@ load (const char *file_name, struct intr_frame *if_) {
 
 	/* Read and verify executable header. */
 	/* 실행 파일 헤더를 읽고 검증한다. */
+	lock_acquire(&filesys_lock);
 	if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
 			|| memcmp (ehdr.e_ident, "\177ELF\2\1\1", 7)
 			|| ehdr.e_type != 2
@@ -872,6 +878,7 @@ load (const char *file_name, struct intr_frame *if_) {
 		printf ("load: %s: error loading executable\n", file_name);
 		goto done;
 	}
+	lock_release(&filesys_lock);
 
 	/* Read program headers. */
 	/* 프로그램 헤더들을 읽는다. */
@@ -879,12 +886,20 @@ load (const char *file_name, struct intr_frame *if_) {
 	for (i = 0; i < ehdr.e_phnum; i++) {
 		struct Phdr phdr;
 
-		if (file_ofs < 0 || file_ofs > file_length (file))
-			goto done;
+		lock_acquire(&filesys_lock);
+		off_t flen = file_length (file);
+		lock_release(&filesys_lock);
+		if (file_ofs < 0 || file_ofs > flen)
+    		goto done;
+
+		lock_acquire(&filesys_lock);
 		file_seek (file, file_ofs);
 
-		if (file_read (file, &phdr, sizeof phdr) != sizeof phdr)
+		if (file_read (file, &phdr, sizeof phdr) != sizeof phdr) {
+			lock_release(&filesys_lock);
 			goto done;
+		}
+		lock_release(&filesys_lock);
 		file_ofs += sizeof phdr;
 		switch (phdr.p_type) {
 			case PT_NULL:
@@ -946,7 +961,9 @@ load (const char *file_name, struct intr_frame *if_) {
 	/* TODO: 여기에 코드를 작성한다.
 	 * TODO: 인자 전달을 구현하라 (project2/argument_passing.html 참고). */
 	t->exec_file = file;
+	lock_acquire(&filesys_lock);
 	file_deny_write(file);
+	lock_release(&filesys_lock);
 	file = NULL;
 
 	success = true;
@@ -1172,9 +1189,11 @@ lazy_load_segment (struct page *page, void *aux_) {
 
 	/* 파일에서 필요한 만큼 읽기 */
 	if (aux->read_bytes > 0) {
+		lock_acquire(&filesys_lock);
 		int n = file_read_at(aux->file, kva, aux->read_bytes, aux->ofs);
+		lock_release(&filesys_lock);
 		if (n != (int)aux->read_bytes) {
-			file_close(aux->file);
+			// file_close(aux->file);
 			free(aux);
 			return false;
 		}
@@ -1185,7 +1204,7 @@ lazy_load_segment (struct page *page, void *aux_) {
     	memset((uint8_t *)kva + aux->read_bytes, 0, aux->zero_bytes);
   	}
 	
-	file_close(aux->file);
+	// file_close(aux->file);
 	free(aux);
 	return true;
 }
@@ -1236,8 +1255,9 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 		/* TODO: lazy_load_segment에 정보를 전달하기 위한 aux를 설정한다. */
 		struct load_aux *aux = malloc(sizeof *aux);
 		if (!aux) return false;
-		aux->file = file_reopen(file);
-		if (aux->file == NULL) { free(aux); return false; }
+		// aux->file = file_reopen(file);
+		// if (aux->file == NULL) { free(aux); return false; }
+		aux->file = file;                 // ★ 실행파일 핸들을 '공유'한다 (reopen/dup X).
 		aux->ofs  = ofs;
 		aux->read_bytes = page_read_bytes;
 		aux->zero_bytes = page_zero_bytes;
@@ -1245,7 +1265,6 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 		/* 파일-백드 페이지로 lazy 등록 */
 		if (!vm_alloc_page_with_initializer(VM_FILE, upage, writable,
 											lazy_load_segment, aux)) {
-			file_close(aux->file); 
 			free(aux);
 			return false;
 		}

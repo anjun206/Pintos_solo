@@ -12,6 +12,7 @@
 
 #define STACK_MAX_BYTES (1 << 20)  // 스택 성장 한계
 
+extern struct lock filesys_lock;
 
 #ifdef VM
 /* process.c의 struct load_aux와 동일한 레이아웃 (미러 선언) */
@@ -34,18 +35,23 @@ static bool spt_less(const struct hash_elem *a, const struct hash_elem *b, void 
   return pa->va < pb->va;
 }
 
-/* UNINIT(FILE)용 aux deep-copy: 파일 핸들은 반드시 duplicate */
-static void *dup_aux_for_file_uninit(const void *aux0) {
-  if (aux0 == NULL) return NULL;
-  const struct load_aux *src = aux0;
-  struct load_aux *dst = malloc(sizeof *dst);
-  if (!dst) return NULL;
-  *dst = *src;
-  if (dst->file) {
-    dst->file = file_duplicate(dst->file);   /* 없으면 file_reopen(dst->file) 사용 */
-    if (!dst->file) { free(dst); return NULL; }
-  }
-  return dst;
+static void *
+dup_aux_for_file_uninit(const void *aux0,
+                        struct file *parent_exec,
+                        struct file *child_exec) {
+	if (aux0 == NULL) return NULL;
+	const struct load_aux *src = aux0;
+	struct load_aux *dst = malloc(sizeof *dst);
+	if (!dst) return NULL;
+	*dst = *src;
+	if (src->file == parent_exec) {
+		dst->file = child_exec;           // ★ per-page duplicate 금지!
+	} else {
+		// (향후 mmap용 등) 실행파일이 아닌 경우에만 reopen(매핑 단위에서 1회가 바람직)
+		dst->file = src->file ? file_reopen(src->file) : NULL;
+		if (src->file && !dst->file) { free(dst); return NULL; }
+	}
+	return dst;
 }
 
 /* Initializes the virtual memory subsystem by invoking each subsystem's
@@ -274,8 +280,9 @@ vm_try_handle_fault (struct intr_frame *f, void *addr,
 	bool near_rsp      = (uintptr_t)addr >= (rsp_base - 32) && (uintptr_t)addr < (uintptr_t)USER_STACK;
 
 
-	// 쓰기 fault + rsp 근처 + 한도 이내만 허용
-	if (write && within_limit && near_rsp) {
+	// if (write && within_limit && near_rsp) {
+	// rsp 근처 + 한도 이내만 허용
+	if (within_limit && near_rsp) {
 		if (!vm_alloc_page(VM_ANON | VM_MARKER_0, uva, true)) return false;
 		return vm_claim_page(uva);
 	}
@@ -375,7 +382,9 @@ supplemental_page_table_init (struct supplemental_page_table *spt UNUSED) {
 /* 보조 페이지 테이블을 src에서 dst로 복사한다. */
 bool
 supplemental_page_table_copy (struct supplemental_page_table *dst,
-                              struct supplemental_page_table *src)
+                              struct supplemental_page_table *src,
+							  struct file *parent_exec_file,
+                              struct file *child_exec_file)
 {
   struct hash_iterator it;
   hash_first(&it, &src->h);
@@ -397,7 +406,9 @@ supplemental_page_table_copy (struct supplemental_page_table *dst,
 		if (VM_TYPE(after) == VM_FILE) {
 			/* lazy_load_segment용 aux deep-copy (파일 핸들 duplicate) */
 			/* 나중에는 file_reopen()하고 file_close()로 대체 권장 */
-			aux_copy = dup_aux_for_file_uninit(sp->uninit.aux);
+   			aux_copy = dup_aux_for_file_uninit (sp->uninit.aux,
+                                      		    parent_exec_file,
+												child_exec_file);
 			if (sp->uninit.aux && aux_copy == NULL) goto fail;
 		} else {
 			/* 보통 UNINIT(ANON)은 aux가 없거나 의미 없음 */
@@ -407,7 +418,7 @@ supplemental_page_table_copy (struct supplemental_page_table *dst,
 		if (!vm_alloc_page_with_initializer(after, va, writable, init, aux_copy)) {
 			if (aux_copy) {
 				struct load_aux *ca = aux_copy;
-				if (ca->file) file_close(ca->file);
+			    if (ca->file && ca->file != child_exec_file) file_close(ca->file);
 			}
 			goto fail;
 		}
