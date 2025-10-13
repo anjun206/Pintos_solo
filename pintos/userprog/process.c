@@ -72,6 +72,9 @@ process_init (void) {
 	struct thread *current = thread_current ();
 	if (!current->proc_inited) {
 		list_init(&current->children);
+	#ifdef VM
+		list_init(&current->mmap_list);
+	#endif
 		current->proc_inited = true;
 	}
 }
@@ -708,6 +711,12 @@ process_cleanup (void) {
 	struct thread *curr = thread_current ();
 
 #ifdef VM
+while (!list_empty(&thread_current()->mmap_list)) {
+  struct list_elem *e = list_front(&thread_current()->mmap_list);
+  struct mmap_region *r = list_entry(e, struct mmap_region, elem);
+  do_munmap(r->addr);
+}
+
 	supplemental_page_table_kill (&curr->spt);
 #endif
 

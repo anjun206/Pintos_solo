@@ -59,14 +59,56 @@ anon_initializer (struct page *page, enum vm_type type, void *kva) {
 /* Swap in the page by read contents from the swap disk. */
 static bool
 anon_swap_in (struct page *page, void *kva) {
-	return true;  // 아직 미구현
+  struct anon_page *ap = &page->anon;
+
+  /* 아직 스왑 안 간 페이지라면 0으로 초기화 (스택/새 anon 페이지 기본값) */
+  if (ap->slot_idx == SIZE_MAX) {
+    memset(kva, 0, PGSIZE);
+    return true;
+  }
+
+  /* 스왑 슬롯에서 복원 (나중에 eviction 구현 시 사용) */
+  lock_acquire(&swap_lock);
+  disk_sector_t base = (disk_sector_t)(ap->slot_idx * SECTORS_PER_SLOT);
+  for (size_t i = 0; i < SECTORS_PER_SLOT; i++) {
+    disk_read(swap_disk, base + i, (uint8_t *)kva + i * DISK_SECTOR_SIZE);
+  }
+  bitmap_reset(swap_table, ap->slot_idx);   /* 슬롯 반환 */
+  lock_release(&swap_lock);
+  ap->slot_idx = SIZE_MAX;
+  return true;
 }
 
 /* Swap out the page by writing contents to the swap disk. */
 static bool
 anon_swap_out (struct page *page) {
-	return true; // 아직 미구현 2
+  /* 아직 eviction 안 쓰면 더미로 true만 줘도 무방. 
+     아래는 나중을 위한 실제 구현(선택) */
+  if (!page->frame || !page->frame->kva) return true;
+
+  lock_acquire(&swap_lock);
+  size_t idx = bitmap_scan_and_flip(swap_table, 0, 1, false);
+  lock_release(&swap_lock);
+  if (idx == BITMAP_ERROR) return false;
+
+  disk_sector_t base = (disk_sector_t)(idx * SECTORS_PER_SLOT);
+  for (size_t i = 0; i < SECTORS_PER_SLOT; i++) {
+    disk_write(swap_disk, base + i, (uint8_t *)page->frame->kva + i * DISK_SECTOR_SIZE);
+  }
+
+  page->anon.slot_idx = idx;
+
+  /* 매핑 해제 및 프레임 반환 */
+  struct thread *cur = thread_current();
+  if (pml4_get_page(cur->pml4, page->va))
+    pml4_clear_page(cur->pml4, page->va);
+  page->frame->page = NULL;
+  vm_free_frame(page->frame);
+  page->frame = NULL;
+
+  return true;
 }
+
 
 /* Destroy the anonymous page. PAGE will be freed by the caller. */
 static void anon_destroy(struct page *page) {

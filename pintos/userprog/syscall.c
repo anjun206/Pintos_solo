@@ -21,6 +21,7 @@
 #include "lib/kernel/hash.h"
 #ifdef VM
 #include "vm/vm.h"
+#include "vm/file.h"
 #endif
 
 
@@ -76,6 +77,9 @@ static void system_seek(int fd, unsigned position);
 static unsigned system_tell(int fd);
 
 static int system_dup2(int oldfd, int newfd);
+
+static void *system_mmap(void *addr, size_t length, int writable, int fd, off_t offset);
+static void  system_munmap(void *addr);
 
 /* 시스템콜 헬퍼 */
 static struct file *fd_get(int fd);
@@ -229,6 +233,19 @@ void syscall_handler(struct intr_frame *f) {
 
     /* dup2 extra 과제 */
     case SYS_DUP2:   RET(f, system_dup2((int)ARG0(f), (int)ARG1(f))); break;
+
+    case SYS_MMAP:
+      RET(f, (uint64_t)system_mmap(
+                (void*)ARG0(f),           // addr
+                (size_t)ARG1(f),          // length
+                (int)ARG2(f),             // writable
+                (int)ARG3(f),             // fd
+                (off_t)ARG4(f)));         // offset
+    break;
+
+    case SYS_MUNMAP:
+      system_munmap((void*)ARG0(f));      // addr
+      break;
 
     default:         system_exit(-1); __builtin_unreachable();
   }
@@ -488,6 +505,32 @@ system_dup2(int oldfd, int newfd) {
   t->fd_table[newfd] = oldf;
   return newfd;
 }
+
+static void *
+system_mmap(void *addr, size_t length, int writable, int fd, off_t offset) {
+  /* 빠른 형식/FD 검증: 나머지 정합성은 do_mmap이 최종 판단 */
+  if (addr == NULL) return NULL;
+  if (!is_user_vaddr(addr)) return NULL;
+  if (pg_ofs(addr) != 0) return NULL;       // 페이지 정렬 필수
+  if (length == 0) return NULL;
+
+  struct file *f = fd_get(fd);
+  if (f == NULL) return NULL;
+  if (f == STDIN_FD || f == STDOUT_FD) return NULL;
+
+  /* do_mmap 내부에서 file_reopen(), 겹침 검사, 파일 길이/offset 처리 */
+  return do_mmap(addr, length, writable, f, offset);
+}
+
+static void
+system_munmap(void *addr) {
+  if (addr == NULL) return;
+  if (!is_user_vaddr(addr)) return;   // 관습상 잘못된 주소면 무시/실패처리
+  do_munmap(addr);
+}
+
+
+/* ----------------------------------------------------- */
 
 // fd 뽑아보기
 static struct

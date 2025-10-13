@@ -249,59 +249,35 @@ vm_handle_wp (struct page *page UNUSED) {
 /* 성공 시 true를 반환한다. */
 bool
 vm_try_handle_fault (struct intr_frame *f, void *addr,
-		bool user, bool write, bool not_present) {
-	if (!not_present) return false;
-	if (!is_user_vaddr(addr) || addr == NULL) return false;
+                     bool user, bool write, bool not_present) {
+  if (!not_present) return false;
+  if (!is_user_vaddr(addr) || addr == NULL) return false;
 
-	/* TODO: Validate the fault */
-	/* TODO: 페이지 폴트를 검증한다. */
-	void *uva = pg_round_down(addr);
-	struct page *page = spt_find_page(&thread_current()->spt, uva);
-	if (page != NULL) {
-		/* 쓰기 의도인데 read-only면 실패 */
-		if (write && !page->writable)
-		return false;
-		/* 실제 프레임을 확보하고 매핑 */
-		return vm_do_claim_page(page);
-	}
+  void *uva = pg_round_down(addr);
 
-	/* TODO: Your code goes here */
-	/* TODO: 여기에 코드를 작성하라. */
+  /* 1) 기존: SPT에 있으면 클레임 */
+  struct page *page = spt_find_page(&thread_current()->spt, uva);
+  if (page != NULL) {
+    if (write && !page->writable) return false;
+    return vm_do_claim_page(page);
+  }
 
-	// rsp 기준값: user PF면 f->rsp, kernel PF면 저장해둔 user_rsp 사용
-	uintptr_t rsp_base = (uintptr_t)(user ? f->rsp : thread_current()->user_rsp);
-	bool within_limit  = (uintptr_t)USER_STACK - (uintptr_t)uva <= (uintptr_t)STACK_MAX_BYTES;
-	bool near_rsp      = (uintptr_t)addr >= (rsp_base - 32) && (uintptr_t)addr < (uintptr_t)USER_STACK;
+  /* 2) 스택 성장 판정 */
+  uintptr_t rsp_base = user
+    ? (uintptr_t)f->rsp
+    : (thread_current()->user_rsp ? (uintptr_t)thread_current()->user_rsp
+                                  : (uintptr_t)USER_STACK);  // Fallback!
 
+  bool within_limit = ((uintptr_t)USER_STACK - (uintptr_t)uva) <= (uintptr_t)STACK_MAX_BYTES;
+  bool near_rsp     = (uintptr_t)addr >= (rsp_base - 32) && (uintptr_t)addr < (uintptr_t)USER_STACK;
 
-	// 쓰기 fault + rsp 근처 + 한도 이내만 허용
-	if (write && within_limit && near_rsp) {
-		if (!vm_alloc_page(VM_ANON | VM_MARKER_0, uva, true)) return false;
-		return vm_claim_page(uva);
-	}
+  /* ★ 읽기 fault여도 near_rsp이면 성장 허용 */
+  if (within_limit && near_rsp) {
+    if (!vm_alloc_page(VM_ANON | VM_MARKER_0, uva, true)) return false;
+    return vm_claim_page(uva);
+  }
 
-	// if (user) {
-	// 	/* 현재 사용자 스택 포인터 */
-	// 	void *rsp = (void *)f->rsp;
-
-	// 	/* 스택 상한 및 푸시/콜 슬랙 판정 */
-	// 	bool below_user_stack = (uintptr_t)addr < (uintptr_t)USER_STACK;
-	// 	bool within_limit =
-	// 		((uintptr_t)USER_STACK - (uintptr_t)uva) <= (uintptr_t)STACK_MAX_BYTES;
-	// 	bool near_rsp =
-	// 		(uintptr_t)addr >= ((uintptr_t)rsp - 32) &&  /* push 등 여유 허용 */
-	// 		(uintptr_t)addr <  (uintptr_t)USER_STACK;
-
-	// 	if (below_user_stack && within_limit && near_rsp) {
-	// 	/* 새 anonymous 스택 페이지를 등록하고 곧바로 클레임 */
-	// 		if (!vm_alloc_page(VM_ANON | VM_MARKER_0, uva, true))
-	// 			return false;
-	// 		return vm_claim_page(uva);
-	// 	}
-	// }
-
-	/* 그 외는 처리 너가해 */
-	return false;
+  return false;
 }
 
 /* Free the page.
