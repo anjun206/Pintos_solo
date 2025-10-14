@@ -47,6 +47,13 @@ bool file_backed_initializer(struct page *page, enum vm_type type, void *kva) {
 static bool file_backed_swap_in(struct page *page, void *kva) {
   	struct file_page *file_page UNUSED = &page->file;
 
+	if (file_page->read_bytes == 0) {
+		memset(kva, 0, PGSIZE);
+		return true;
+	}
+
+  	ASSERT(file_page->file != NULL);
+
 	lock_acquire(&filesys_lock);
 	uint32_t n = file_read_at(file_page->file, kva, file_page->read_bytes, file_page->offset);
 	lock_release(&filesys_lock);
@@ -87,15 +94,25 @@ static void file_backed_destroy(struct page *page) {
 	struct file_page *file_page = &page->file;
 	struct thread *t = page->owner;
 
-	if (page->frame) (void)file_backed_swap_out(page);
+	if (page->frame) {
+		(void)file_backed_swap_out(page);
 
-  	if (t && t->pml4) pml4_clear_page(t->pml4, page->va);
+  		if (t && t->pml4) pml4_clear_page(t->pml4, page->va);
 
+		struct frame *fr = page->frame;   // ★ 보관
+		fr->page = NULL;
+		fr->pinned = false;
+		page->frame = NULL;
+
+		vm_free_frame(fr);                // ★ 제대로 해제
+	}
 	// refcount로 공유 핸들 정리
 	if (file_page->ctx) {
 		if (file_page->ctx->refcnt > 0) file_page->ctx->refcnt--;
 		if (file_page->ctx->refcnt == 0) {
-			file_close (file_page->ctx->file);
+			lock_acquire(&filesys_lock);
+			file_close(file_page->ctx->file);
+			lock_release(&filesys_lock);
 			free (file_page->ctx);
 		}
 		file_page->ctx = NULL;
@@ -118,10 +135,9 @@ void *do_mmap(void *addr, size_t length, int writable, struct file *file,
 
 
 	// 파일 객체의 byte 길이
+	lock_acquire(&filesys_lock);
 	off_t file_len = file_length(file);
-	if (file_len == 0) {
-		return NULL;
-	}
+	lock_release(&filesys_lock);
 
 	// 할당되야하는 페이지 수
 	size_t page_count = (length + (PGSIZE - 1)) / PGSIZE;
@@ -137,54 +153,81 @@ void *do_mmap(void *addr, size_t length, int writable, struct file *file,
 	// 매핑-wide 핸들 & refcnt
 	struct mmap_ctx *ctx = malloc(sizeof *ctx);
 	if (!ctx) return NULL;
+
+	lock_acquire(&filesys_lock);
 	ctx->file = file_reopen(file);
+	lock_release(&filesys_lock);
+
 	if (!ctx->file) { free(ctx); return NULL; }
 	ctx->refcnt = 0;
+
+	// 매핑 메타(리스트 노드)
+	struct mmap_file *mm = malloc(sizeof *mm);
+	if (!mm) { 
+		lock_acquire(&filesys_lock);
+		file_close(ctx->file);
+		lock_release(&filesys_lock);
+
+		free(ctx); return NULL; 
+	}
+	mm->base = base;
+	mm->page_cnt = 0;
+	mm->ctx = ctx;
+	list_push_back(&cur->mmap_list, &mm->elem);
 
 	// 페이지별 할당
 	size_t remain = length;
 	off_t ofs = offset;
 
 	// 할당해야 하는 페이지 수 만큼 반복
-	for (int i = 0; i < page_count; i++) {
-		// aux 생성
+	for (size_t i = 0; i < (length + PGSIZE - 1) / PGSIZE; i++) {
 		struct file_page *aux = malloc(sizeof *aux);
-		if (!aux) {
-			do_munmap(upage);
-			return NULL;
-		};
+		if (!aux) goto rollback;
 
-		// [수정] 페이지 단위로 읽을 양 계산 (≤ PGSIZE)
 		size_t step = remain < PGSIZE ? remain : PGSIZE;
 		size_t file_left = ofs < file_len ? (size_t)(file_len - ofs) : 0;
-		size_t file_read_byte = file_left < step ? file_left : step;
-		size_t file_zero_byte = PGSIZE - file_read_byte;
+		size_t rbytes = file_left < step ? file_left : step;
+		size_t zbytes = PGSIZE - rbytes;
 
 		aux->file = ctx->file;
 		aux->offset = ofs;
-		aux->read_bytes = file_read_byte;
-		aux->zero_bytes = file_zero_byte;
+		aux->read_bytes = rbytes;
+		aux->zero_bytes = zbytes;
 		aux->is_mmap = true;
 		aux->ctx = ctx;
 
-		// 페이지 할당
-		if (!vm_alloc_page_with_initializer(VM_FILE, upage, writable,
-											lazy_load_mmap, aux)) {
+		if (!vm_alloc_page_with_initializer(VM_FILE, upage, writable, lazy_load_mmap, aux)) {
 			free(aux);
-			do_munmap(upage);
-			file_close(aux->file);
-			free(ctx);
-			return NULL;
+			goto rollback;
 		}
 
-		// 다음 페이지로
-		ctx->refcnt++;			// 페이지 하나 등록
-		remain -= step;         // 매핑 길이는 PGSIZE 기준으로 소모
-		ofs += file_read_byte;  // 파일 오프셋은 실제 읽은 만큼만 전진
-		upage += PGSIZE;
+		ctx->refcnt++;
+		mm->page_cnt++;     // ← 지금까지 몇 장 만들었는지 기록
+		remain -= step;
+		ofs    += rbytes;
+		upage  += PGSIZE;
 	}
-
 	return base;
+
+	rollback:
+	// 정확히 mm->page_cnt 만큼만 되돌림 (base부터)
+	for (size_t j = 0; j < mm->page_cnt; j++) {
+		void *va = (uint8_t *)base + j * PGSIZE;
+		struct page *p = spt_find_page(&cur->spt, va);
+		if (p) {
+			hash_delete(&cur->spt.h, &p->spt_elem);
+			vm_dealloc_page(p);
+		}
+	}
+	list_remove(&mm->elem);
+
+	lock_acquire(&filesys_lock);
+	if (ctx->file) file_close(ctx->file);
+	lock_release(&filesys_lock);
+
+	free(ctx);
+	free(mm);
+	return NULL;
 }
 
 static bool lazy_load_mmap(struct page *page, void *aux_) {
@@ -213,14 +256,26 @@ static bool lazy_load_mmap(struct page *page, void *aux_) {
 /* Do the munmap */
 void do_munmap(void *addr) {
 	struct thread *cur = thread_current();
-	for (;;) {
-		struct page *p = spt_find_page(&cur->spt, addr);
-		if (!p) break;
+	struct mmap_file *mm = NULL;
+
+	// 해당 매핑 찾기
+	for (struct list_elem *e = list_begin(&cur->mmap_list);
+		e != list_end(&cur->mmap_list); e = list_next(e)) {
+		struct mmap_file *x = list_entry(e, struct mmap_file, elem);
+		if (x->base == addr) { mm = x; break; }
+	}
+	if (!mm) return;
+
+	// 페이지 수만큼만 해제
+	for (size_t i = 0; i < mm->page_cnt; i++) {
+		void *va = mm->base + i * PGSIZE;
+		struct page *p = spt_find_page(&cur->spt, va);
+		if (!p) continue;
 
 		hash_delete(&cur->spt.h, &p->spt_elem);
-
 		vm_dealloc_page(p);
-
-		addr += PGSIZE;
 	}
+
+	list_remove(&mm->elem);
+	free(mm);
 }

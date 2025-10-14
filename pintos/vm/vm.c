@@ -201,16 +201,39 @@ spt_remove_page (struct supplemental_page_table *spt, struct page *page) {
 
 /* Get the struct frame, that will be evicted. */
 /* 제거(evict)될 프레임을 가져온다. */
-static struct frame *
-vm_get_victim(void) {
+// static struct frame *
+// vm_get_victim(void) {
+// 	if (list_empty(&frame_table)) return NULL;
+// 	struct list_elem *e = list_begin(&frame_table);
+// 	while (e != list_end(&frame_table)) {
+// 		struct frame *f = list_entry(e, struct frame, elem);
+// 		if (!f->pinned && f->page != NULL) return f;   // 첫 unpinned
+// 		e = list_next(e);
+// 	}
+// 	return NULL; // 전부 pinned면 실패
+// }
+
+static struct frame *clock_pick_victim(void) {
 	if (list_empty(&frame_table)) return NULL;
-	struct list_elem *e = list_begin(&frame_table);
-	while (e != list_end(&frame_table)) {
-		struct frame *f = list_entry(e, struct frame, elem);
-		if (!f->pinned && f->page != NULL) return f;   // 첫 unpinned
-		e = list_next(e);
+	if (clock_hand == NULL || clock_hand == list_end(&frame_table))
+		clock_hand = list_begin(&frame_table);
+
+	size_t scans = 0, limit = list_size(&frame_table) * 2; // 안전장치
+	for (size_t scans = 0; scans < limit; scans++) {
+		struct frame *f = list_entry(clock_hand, struct frame, elem);
+		clock_hand = list_next(clock_hand);
+		if (clock_hand == list_end(&frame_table)) clock_hand = list_begin(&frame_table);
+
+		if (f->page == NULL || f->pinned) continue;
+		struct page *p = f->page;
+		struct thread *o = p->owner;
+		if (o && pml4_is_accessed(o->pml4, p->va)) {
+			pml4_set_accessed(o->pml4, p->va, false);
+			continue;
+		}
+		return f; // accessed=0 + unpinned
 	}
-	return NULL; // 전부 pinned면 실패
+	return NULL;
 }
 
 
@@ -219,40 +242,35 @@ vm_get_victim(void) {
 /* 페이지 하나를 제거하고 해당 프레임을 반환한다.
  * 오류 시 NULL을 반환한다. */
 static struct frame *
-vm_evict_frame (void) {
-	/* TODO: swap out the victim and return the evicted frame. */
-	/* TODO: victim을 스왑 아웃하고 제거된 프레임을 반환한다. */
+vm_evict_frame(void) {
+	struct frame *victim;
+	struct page  *vp;
+
 	lock_acquire(&frame_table_lock);
-	struct frame *victim = vm_get_victim();
-	if (victim == NULL) {
-		lock_release(&frame_table_lock);
-		return NULL;
-	}
-
-	struct page *vp = victim->page;
-	ASSERT(vp != NULL);
+	victim = clock_pick_victim();
+	if (!victim) { lock_release(&frame_table_lock); return NULL; }
+	vp = victim->page;
+	ASSERT(vp && !victim->pinned);
 	victim->pinned = true;
+	lock_release(&frame_table_lock);
 
-	// 1) 백업/폐기 결정: page->operations->swap_out(page)
-	bool ok = swap_out(vp);  // == vp->operations->swap_out(vp)
-	if (!ok) {
+	// === I/O (swap/file) : 프레임 락 없이 ===
+	bool ok = swap_out(vp); // vp->operations->swap_out(vp)
+	if (!ok) {              // 실패 시 pin 해제만 하고 반환
+		lock_acquire(&frame_table_lock);
 		victim->pinned = false;
 		lock_release(&frame_table_lock);
 		return NULL;
 	}
+	if (vp->owner && vp->owner->pml4) pml4_clear_page(vp->owner->pml4, vp->va);
 
-	// 2) 매핑 해제 (owner pml4에서 present bit 끔)
-	if (vp->owner && vp->owner->pml4) {
-		pml4_clear_page(vp->owner->pml4, vp->va);
-	}
-
-	// 3) 연결 끊기
-	vp->frame = NULL;
+	// === 연결 정리 (짧게만 락 잡기) ===
+	lock_acquire(&frame_table_lock);
+	vp->frame   = NULL;
 	victim->page = NULL;
 	victim->pinned = false;
-
-	// 재사용을 위해 frame은 리스트에 계속 둔다 (kva 재사용)
 	lock_release(&frame_table_lock);
+
 	return victim;
 }
 
@@ -381,8 +399,20 @@ vm_claim_page (void *va UNUSED) {
 void vm_free_frame(struct frame *frame) {
 	ASSERT(frame != NULL);
 	ASSERT(frame->page == NULL);
-	palloc_free_page(frame->kva);
-	free(frame);
+	lock_acquire(&frame_table_lock);
+
+	// ★ clock_hand가 제거될 노드를 가리키면 한 칸 미리 이동
+	if (clock_hand == &frame->elem) {
+		clock_hand = list_next(clock_hand);
+		if (clock_hand == list_end(&frame_table))
+			clock_hand = list_begin(&frame_table);
+	}
+
+	list_remove(&frame->elem);          // ★ 리스트에서 빼기
+	lock_release(&frame_table_lock);
+	
+	palloc_free_page(frame->kva);       // ★ 물리 페이지 반납
+	free(frame);                        // ★ 메타 해제
 }
 
 /* Claim the PAGE and set up the mmu. */

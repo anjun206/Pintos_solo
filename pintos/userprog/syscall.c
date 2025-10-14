@@ -504,16 +504,17 @@ system_dup2(int oldfd, int newfd) {
 #ifdef VM
 static void *system_mmap(void *addr, size_t length, int writable, int fd, off_t offset) {
   /* 규격 검증 */
-  if (addr == NULL || length == 0) return NULL;
-  if (pg_ofs(addr) != 0) return NULL;
-  if (offset % PGSIZE != 0) return NULL;
+  if (addr == NULL || length == 0) return ((void *) -1);
+  if (pg_ofs(addr) != 0) return ((void *) -1);
+  if (offset % PGSIZE != 0) return ((void *) -1);
 
   struct file *f = fd_get(fd);
-  if (f == NULL) return NULL;
-  if (f == STDIN_FD || f == STDOUT_FD) return NULL;
+  if (f == NULL || f == STDIN_FD || f == STDOUT_FD) return ((void *) -1);
+
 
   /* file_reopen은 do_mmap 내부에서 수행하므로 원본 파일로 호출 */
-  return do_mmap(addr, length, writable, f, offset);
+  void *r = do_mmap(addr, length, writable, f, offset);
+  return r ? r : ((void *) -1);
 }
 
 static void system_munmap(void *addr) {
@@ -551,6 +552,17 @@ assert_user_range(const void *uaddr, size_t size) {
     if (pml4_get_page(thread_current()->pml4, p) == NULL) system_exit(-1);
 #endif
   }
+}
+
+
+// 작은 헬퍼
+static void pin_user_page(void *u) {
+  struct page *p = spt_find_page(&thread_current()->spt, pg_round_down(u));
+  if (p && p->frame) p->frame->pinned = true;
+}
+static void unpin_user_page(void *u) {
+  struct page *p = spt_find_page(&thread_current()->spt, pg_round_down(u));
+  if (p && p->frame) p->frame->pinned = false;
 }
 
 static bool
@@ -600,7 +612,9 @@ copy_in(void *kdst, const void *usrc, size_t n) {
     uint8_t *ksrc = (uint8_t *)kp + pg_ofs(u);
 #endif
 
+    pin_user_page(u);
     memcpy(kd, ksrc, chunk);
+    unpin_user_page(u);
     kd += chunk;
     u  += chunk;
     n  -= chunk;
@@ -625,7 +639,9 @@ copy_out(void *udst, const void *ksrc, size_t n) {
     uint8_t *kdst = (uint8_t *)kp + pg_ofs(u);
 #endif
 
+    pin_user_page(u);
     memcpy(kdst, k, chunk);
+    unpin_user_page(u);
     u += chunk;
     k += chunk;
     n -= chunk;

@@ -9,9 +9,10 @@ struct page;
 enum vm_type;
 
 struct mmap_file {
-  struct file *file;   /* file_reopen() 한 핸들 (매핑 단위로 1개) */
+  // struct file *file;   /* file_reopen() 한 핸들 (매핑 단위로 1개) */
+  size_t page_cnt;
   void *base;          /* 매핑 시작 유저 주소 (page-aligned) */
-  size_t length;       /* 요청 길이 (바이트, 마지막 페이지는 일부만 사용 가능) */
+  struct mmap_ctx *ctx; 
   struct list_elem elem;
 };
 
