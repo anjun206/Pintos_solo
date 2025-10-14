@@ -49,6 +49,8 @@ struct page {
 
 	bool writable;	// 매핑용
 
+	struct thread *owner;
+
 	/* Your implementation */
 
 	/* Per-type data are binded into the union.
@@ -67,6 +69,8 @@ struct page {
 struct frame {
 	void *kva;
 	struct page *page;
+	bool pinned;
+	struct list_elem elem;
 };
 
 /* The function table for page operations.

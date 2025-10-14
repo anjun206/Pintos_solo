@@ -15,11 +15,18 @@ struct mmap_file {
   struct list_elem elem;
 };
 
+struct mmap_ctx {
+  struct file *file;
+  size_t refcnt;
+};
+
 struct file_page {
   struct file *file;       /* backing file (mmap이나 exec) */
   off_t offset;               /* 이 페이지의 파일 오프셋 */
   size_t read_bytes;       /* fault-in 시 파일에서 읽을 바이트 수 */
   size_t zero_bytes;       /* 나머지를 0으로 채울 바이트 수 */
+  bool is_mmap;
+  struct mmap_ctx *ctx;   // 추가: 매핑 단위 공유 핸들
 };
 
 

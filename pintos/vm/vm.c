@@ -14,6 +14,11 @@
 
 extern struct lock filesys_lock;
 
+static struct list frame_table;
+static struct list_elem *clock_hand;
+static struct lock frame_table_lock;
+
+
 #ifdef VM
 /* process.c의 struct load_aux와 동일한 레이아웃 (미러 선언) */
 struct load_aux {
@@ -65,6 +70,9 @@ vm_init (void) {
 #ifdef EFILESYS  /* For project 4 */
 	pagecache_init ();
 #endif
+	list_init(&frame_table);
+	lock_init(&frame_table_lock);
+	clock_hand = list_begin(&frame_table);
 	register_inspect_intr ();
 	/* DO NOT MODIFY UPPER LINES. */
 	/* 위의 줄은 수정하지 말 것. */
@@ -88,6 +96,7 @@ page_get_type (struct page *page) {
 			return ty;
 	}
 }
+
 
 /* Helpers */
 /* 헬퍼 함수들 */
@@ -142,6 +151,7 @@ vm_alloc_page_with_initializer (enum vm_type type, void *upage, bool writable,
 		uninit_new(page, upage, init, type, aux, type_init);
 
 		page->writable = writable;
+		page->owner = thread_current();
 
 		/* TODO: Insert the page into the spt. */
 		/* TODO: 페이지를 보조 페이지 테이블에 삽입한다. */
@@ -192,13 +202,17 @@ spt_remove_page (struct supplemental_page_table *spt, struct page *page) {
 /* Get the struct frame, that will be evicted. */
 /* 제거(evict)될 프레임을 가져온다. */
 static struct frame *
-vm_get_victim (void) {
-	struct frame *victim = NULL;
-	 /* TODO: The policy for eviction is up to you. */
-	 /* TODO: 어떤 프레임을 제거할지 결정하는 정책은 직접 구현한다. */
-
-	return victim;
+vm_get_victim(void) {
+	if (list_empty(&frame_table)) return NULL;
+	struct list_elem *e = list_begin(&frame_table);
+	while (e != list_end(&frame_table)) {
+		struct frame *f = list_entry(e, struct frame, elem);
+		if (!f->pinned && f->page != NULL) return f;   // 첫 unpinned
+		e = list_next(e);
+	}
+	return NULL; // 전부 pinned면 실패
 }
+
 
 /* Evict one page and return the corresponding frame.
  * Return NULL on error.*/
@@ -206,11 +220,40 @@ vm_get_victim (void) {
  * 오류 시 NULL을 반환한다. */
 static struct frame *
 vm_evict_frame (void) {
-	struct frame *victim UNUSED = vm_get_victim ();
 	/* TODO: swap out the victim and return the evicted frame. */
 	/* TODO: victim을 스왑 아웃하고 제거된 프레임을 반환한다. */
+	lock_acquire(&frame_table_lock);
+	struct frame *victim = vm_get_victim();
+	if (victim == NULL) {
+		lock_release(&frame_table_lock);
+		return NULL;
+	}
 
-	return NULL;
+	struct page *vp = victim->page;
+	ASSERT(vp != NULL);
+	victim->pinned = true;
+
+	// 1) 백업/폐기 결정: page->operations->swap_out(page)
+	bool ok = swap_out(vp);  // == vp->operations->swap_out(vp)
+	if (!ok) {
+		victim->pinned = false;
+		lock_release(&frame_table_lock);
+		return NULL;
+	}
+
+	// 2) 매핑 해제 (owner pml4에서 present bit 끔)
+	if (vp->owner && vp->owner->pml4) {
+		pml4_clear_page(vp->owner->pml4, vp->va);
+	}
+
+	// 3) 연결 끊기
+	vp->frame = NULL;
+	victim->page = NULL;
+	victim->pinned = false;
+
+	// 재사용을 위해 frame은 리스트에 계속 둔다 (kva 재사용)
+	lock_release(&frame_table_lock);
+	return victim;
 }
 
 /* palloc() and get frame. If there is no available page, evict the page
@@ -225,18 +268,19 @@ static struct frame *
 vm_get_frame (void) {
 	void *kva = palloc_get_page(PAL_USER);
 
-	// oom시 아직은 패닉으로 처리 나중에 evict로 대체
-	if (kva == NULL) PANIC("vm get frame 실패");
-
-	struct frame *frame = malloc(sizeof *frame);
-	/* TODO: Fill this function. */
-	/* TODO: 이 함수를 구현하라. */
-
-	ASSERT (frame != NULL);
-	frame->kva = kva;
-	frame->page = NULL;
-	// 나중에 프레임에 추가 기능
-	return frame;
+	if (kva) {
+		struct frame *f = malloc(sizeof *f);
+		ASSERT(f != NULL);
+		f->kva = kva;
+		f->page = NULL;
+		f->pinned = false;
+		lock_acquire(&frame_table_lock);
+		list_push_back(&frame_table, &f->elem);
+		if (clock_hand == list_end(&frame_table)) clock_hand = list_begin(&frame_table);
+		lock_release(&frame_table_lock);
+		return f;
+	}
+	return vm_evict_frame();
 }
 
 /* Growing the stack. */
@@ -352,6 +396,8 @@ vm_do_claim_page (struct page *page) {
 	frame->page = page;
 	page->frame = frame;
 
+	frame->pinned = true;
+
 	/* TODO: Insert page table entry to map page's VA to frame's PA. */
 	/* TODO: 페이지의 VA를 프레임의 PA에 매핑하는 페이지 테이블 엔트리를 삽입한다. */
 	struct thread *cur = thread_current();
@@ -368,6 +414,8 @@ vm_do_claim_page (struct page *page) {
 		vm_free_frame(frame);
 		return false;
 	}
+
+	frame->pinned = false;
 	return true;
 }
 
