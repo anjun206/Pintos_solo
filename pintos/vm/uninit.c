@@ -10,6 +10,7 @@
 
 #include "vm/vm.h"
 #include "vm/uninit.h"
+#include "threads/malloc.h"
 #define PGSIZE  (1 << 12)
 
 static bool uninit_initialize (struct page *page, void *kva);

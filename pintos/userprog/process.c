@@ -25,6 +25,7 @@
 #include "lib/kernel/hash.h"
 #ifdef VM
 #include "vm/vm.h"
+#include "vm/file.h"
 #endif
 
 extern struct lock filesys_lock;
@@ -74,6 +75,9 @@ process_init (void) {
 	struct thread *current = thread_current ();
 	if (!current->proc_inited) {
 		list_init(&current->children);
+#ifdef VM
+    	list_init(&current->mmap_list);
+#endif
 		current->proc_inited = true;
 	}
 }
@@ -652,29 +656,36 @@ process_exit (void) {
 	 * TODO: 프로세스 자원 해제를 여기에서 구현하는 것을 권장한다. */
 	struct thread *cur = thread_current ();
 
+#ifdef VM
+	/* 먼저 모든 mmap 암묵 해제 */
+	while (!list_empty(&cur->mmap_list)) {
+		struct mmap_file *mm = list_entry(list_front(&cur->mmap_list), struct mmap_file, elem);
+		do_munmap(mm->base);
+	}
+#endif
 
-		if (cur->fd_table) {
-			for (int i = 0; i < cur->fd_cap; i++) {
-				struct file *p = cur->fd_table ? cur->fd_table[i] : NULL;
-				if (!p) continue;
-				cur->fd_table[i] = NULL;
-				fdref_dec(p);
-			}
+	if (cur->fd_table) {
+		for (int i = 0; i < cur->fd_cap; i++) {
+			struct file *p = cur->fd_table ? cur->fd_table[i] : NULL;
+			if (!p) continue;
+			cur->fd_table[i] = NULL;
+			fdref_dec(p);
 		}
+	}
 
-		if (cur->exec_file) {
-			file_allow_write(cur->exec_file);
-			file_close(cur->exec_file);
-			cur->exec_file = NULL;
-		}
+	if (cur->exec_file) {
+		file_allow_write(cur->exec_file);
+		file_close(cur->exec_file);
+		cur->exec_file = NULL;
+	}
 
-		if (cur->fd_table) {
-			if (cur->fd_table_from_palloc) palloc_free_page(cur->fd_table);
-			else free(cur->fd_table);
-			cur->fd_table = NULL;
-			cur->fd_cap = 0;
-			cur->fd_table_from_palloc = false;
-		}
+	if (cur->fd_table) {
+		if (cur->fd_table_from_palloc) palloc_free_page(cur->fd_table);
+		else free(cur->fd_table);
+		cur->fd_table = NULL;
+		cur->fd_cap = 0;
+		cur->fd_table_from_palloc = false;
+	}
 
 	/* 유저 프로세스 에서만 */
 	if (cur->proc_inited) {
