@@ -14,6 +14,8 @@ static bool file_backed_swap_out(struct page *page);
 static void file_backed_destroy(struct page *page);
 static bool lazy_load_mmap(struct page *page, void *aux_);
 
+extern struct lock filesys_lock;
+
 /* DO NOT MODIFY this struct */
 static const struct page_operations file_ops = {
     .swap_in = file_backed_swap_in,
@@ -24,28 +26,75 @@ static const struct page_operations file_ops = {
 
 /* The initializer of file vm */
 void vm_file_init(void) {
-  /* 아직 준비할 건 없음
-   * 필요 시 락/리스트 등을 여기서 초기화 */
+	/* 아직 준비할 건 없음
+	* 필요 시 락/리스트 등을 여기서 초기화 
+	* 그냥 필요 없음 락은 syscall에서 초기화
+	*/
 }
 
 /* Initialize the file backed page */
 bool file_backed_initializer(struct page *page, enum vm_type type, void *kva) {
-  page->operations = &file_ops;
-  // exec 경로 안전을 위해 기본값 초기화만 (mmap은 lazy_load_mmap에서 채움)
-  page->file.file = NULL;
-  page->file.offset = 0;
-  page->file.read_bytes = 0;
-  page->file.zero_bytes = 0;
-  return true;
+	page->operations = &file_ops;
+	// exec 경로 안전을 위해 기본값 초기화만 (mmap은 lazy_load_mmap에서 채움)
+	page->file.file = NULL;
+	page->file.offset = 0;
+	page->file.read_bytes = 0;
+	page->file.zero_bytes = 0;
+	return true;
 }
 /* Swap in the page by read contents from the file. */
 static bool file_backed_swap_in(struct page *page, void *kva) {
-  struct file_page *file_page UNUSED = &page->file;
+  	struct file_page *file_page UNUSED = &page->file;
+	page->frame->pinned = true;
+	/* 파일->kva로 읽기 */
+	// 락
+	// 파일 읽어오기
+	// 락
+	// 빈곳 0으로 채우기
+	// 성공 반환
+	lock_acquire(&filesys_lock);
+	uint32_t n = file_read_at(file_page->file, kva, file_page->read_bytes, file_page->offset);
+	lock_release(&filesys_lock);
+
+	if (n != (uint32_t)file_page->read_bytes) {
+		page->frame->pinned = false;
+		return false;
+	}
+
+	if (file_page->read_bytes < PGSIZE) {
+		memset((uint8_t *)kva + file_page->read_bytes, 0, PGSIZE - file_page->read_bytes);
+	}
+
+	page->frame->pinned = false;
+	return true;
 }
 
 /* Swap out the page by writeback contents to the file. */
 static bool file_backed_swap_out(struct page *page) {
-  struct file_page *file_page UNUSED = &page->file;
+  	struct file_page *file_page UNUSED = &page->file;
+	struct frame *frame = page->frame;
+
+	void *kva = frame->kva;
+	// dirty?
+		// lock
+		// 파일에 쓰기
+		// lock
+		// dirty!
+	// no dirty
+		// 그냥 보내기
+	// 성공 반환
+	if (pml4_is_dirty(frame->owner->pml4, page->va) && page->writable) {
+		page->frame->pinned = true;
+		lock_acquire(&filesys_lock);
+		size_t written = file_write_at(file_page->file, kva, file_page->read_bytes, file_page->offset);
+		lock_release(&filesys_lock);
+		page->frame->pinned = false;
+
+		if (written != (size_t)file_page->read_bytes) return false;
+		pml4_set_dirty(frame->owner->pml4, page->va, false);
+	}
+
+	return true;
 }
 
 /* Destory the file backed page. PAGE will be freed by the caller. */
@@ -54,16 +103,20 @@ static void file_backed_destroy(struct page *page) {
 	struct thread *cur = thread_current();
 
 	// mmap 페이지로 초기화된 경우에만 write-back
-	if (page->frame && file_page->file != NULL) {
+	if (page->frame && file_page->file && page->writable) {
 		if (pml4_is_dirty(cur->pml4, page->va)) {
 			// 페이지가 수정, 기록되었는지(dirty) 확인
-			// filesys_lock_acquire();
+			lock_acquire(&filesys_lock);
 			file_write_at(file_page->file, page->frame->kva, file_page->read_bytes,
 							file_page->offset);
-			// 변경된 내용을 파일의 올바른 위치(offset)에 다시 쓰는 로직
+			// 변경된 내용을 파일의 올바른 위치(offset)에 다시 쓰는 로직			
+			lock_release(&filesys_lock);
 			pml4_set_dirty(cur->pml4, page->va, 0);
-			// filesys_lock_release();  // 락 해야하나?
 		}
+	}
+	if (file_page->file) {
+		file_close(file_page->file);
+		file_page->file = NULL;
 	}
 
 	pml4_clear_page(cur->pml4, page->va);
@@ -139,7 +192,7 @@ void *do_mmap(void *addr, size_t length, int writable, struct file *file,
 											lazy_load_mmap, aux)) {
 			file_close(aux->file);
 			free(aux);
-			do_munmap(upage);
+			do_munmap(base);
 			// file_close(mmap_file);
 			return NULL;
 		}
@@ -154,32 +207,40 @@ void *do_mmap(void *addr, size_t length, int writable, struct file *file,
 }
 
 static bool lazy_load_mmap(struct page *page, void *aux_) {
-  ASSERT(page != NULL);
-  ASSERT(page->frame != NULL);
+	ASSERT(page != NULL);
+	ASSERT(page->frame != NULL);
 
-  // struct file_page *file_page = &page->file;
-  // void *kva = page->frame->kva;
-  struct file_page *file_page = &page->file;
-  struct file_page *init = aux_;
-  *file_page = *init;
-  free(init);
-  void *kva = page->frame->kva;
+	// struct file_page *file_page = &page->file;
+	// void *kva = page->frame->kva;
+	struct file_page *file_page = &page->file;
+	struct file_page *init = aux_;
+	*file_page = *init;
+	free(init);
 
-  /* 파일에서 필요한 만큼 읽기 */
-  if (file_page->read_bytes > 0) {
-    int n = file_read_at(file_page->file, kva, file_page->read_bytes,
-                         file_page->offset);
-    if (n != (int)file_page->read_bytes) {
-      return false;
-    }
-  }
+	void *kva = page->frame->kva;
+	page->frame->pinned = true;
 
-  /* 남은 공간 0으로 채우기 */
-  if (file_page->zero_bytes > 0) {
-    memset((uint8_t *)kva + file_page->read_bytes, 0, file_page->zero_bytes);
-  }
+	/* 파일에서 필요한 만큼 읽기 */
+	int n = 0;
+	if (file_page->read_bytes > 0) {
+		lock_acquire(&filesys_lock);
+		n = file_read_at(file_page->file, kva, file_page->read_bytes, file_page->offset);
+		lock_release(&filesys_lock);
 
-  return true;
+		if (n != (int)file_page->read_bytes) {
+			page->frame->pinned = false;
+			return false;
+		}
+	}
+	
+
+	/* 남은 공간 0으로 채우기 */
+	if (file_page->zero_bytes > 0) {
+		memset((uint8_t *)kva + file_page->read_bytes, 0, file_page->zero_bytes);
+	}
+
+	page->frame->pinned = false;
+	return true;
 }
 
 /* Do the munmap */
@@ -194,7 +255,7 @@ void do_munmap(void *addr) {
     // page->file.aux = aux;
 
     hash_delete(&cur->spt.h, &page->spt_elem);
-    file_backed_destroy(page);
+    // file_backed_destroy(page);
     vm_dealloc_page(page);
 
     addr += PGSIZE;

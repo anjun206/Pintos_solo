@@ -12,7 +12,11 @@
 
 #define STACK_MAX_BYTES (1 << 20)  // 스택 성장 한계
 
-extern struct lock filesys_lock;
+static struct list frame_table;            /* 모든 프레임을 담는 전역 리스트 */
+static struct list_elem *clock_hand;       /* 시계바늘 */
+static struct lock frame_table_lock;       /* 프레임 테이블 보호 락 */
+
+static struct lock filesys_lock;
 
 #ifdef VM
 /* process.c의 struct load_aux와 동일한 레이아웃 (미러 선언) */
@@ -62,6 +66,9 @@ void
 vm_init (void) {
 	vm_anon_init ();
 	vm_file_init ();
+	lock_init(&frame_table_lock);
+	list_init(&frame_table);
+	clock_hand = NULL;
 #ifdef EFILESYS  /* For project 4 */
 	pagecache_init ();
 #endif
@@ -189,16 +196,63 @@ spt_remove_page (struct supplemental_page_table *spt, struct page *page) {
 	vm_dealloc_page(page);
 }
 
-/* Get the struct frame, that will be evicted. */
-/* 제거(evict)될 프레임을 가져온다. */
-static struct frame *
-vm_get_victim (void) {
-	struct frame *victim = NULL;
-	 /* TODO: The policy for eviction is up to you. */
-	 /* TODO: 어떤 프레임을 제거할지 결정하는 정책은 직접 구현한다. */
-
-	return victim;
+static inline struct frame *fe2frame(struct list_elem *e) {
+  	return list_entry(e, struct frame, elem);
 }
+
+/* 시계바늘이 유효 범위를 벗어나면 리스트의 시작으로 돌린다. */
+static inline struct list_elem *clock_next(struct list_elem *e) {
+	if (e == NULL) return list_begin(&frame_table);
+	e = list_next(e);
+	if (e == list_end(&frame_table)) e = list_begin(&frame_table);
+	return e;
+}
+
+/* ===== Victim 선정: 2nd-chance(Clock) ===== */
+static struct frame *vm_get_victim(void) {
+	lock_acquire(&frame_table_lock);
+
+	if (list_empty(&frame_table))
+		PANIC("vm_get_victim: frame_table empty");
+
+	/* 시계바늘 초기 위치 설정 */
+	if (clock_hand == NULL || clock_hand == list_end(&frame_table))
+		clock_hand = list_begin(&frame_table);
+
+	size_t seen = 0;
+	size_t total = list_size(&frame_table);
+
+	struct list_elem *e = clock_hand;
+	while (seen < total * 2) { /* 최악 2바퀴 안에 반드시 결정 */
+		struct frame *f = fe2frame(e);
+		e = clock_next(e);   /* 다음 칸으로 바늘 미리 이동 */
+
+		/* 비어 있거나(p->NULL), I/O 중이거나(pinned)면 스킵 */
+		if (f->page == NULL || f->pinned) { seen++; continue; }
+
+		struct thread *owner = f->owner;
+		void *uva = f->page->va;
+
+		/* Accessed=1 이면 0으로 지우고 이번엔 패스(두 번째 기회) */
+		if (pml4_is_accessed(owner->pml4, uva)) {
+			pml4_set_accessed(owner->pml4, uva, false);
+			seen++;
+			continue;
+		}
+
+		/* 선정! 점유 표시 후 바늘 위치 갱신하고 반환 */
+		f->pinned = true;
+		clock_hand = e;  /* 다음 스캔 출발점 */
+		lock_release(&frame_table_lock);
+		return f;
+	}
+
+	/* 여기 오면 퇴출 가능한 프레임이 전혀 없음 */
+	lock_release(&frame_table_lock);
+	PANIC("vm_get_victim: no evictable frame (all pinned?)");
+	return NULL; /* not reached */
+}
+
 
 /* Evict one page and return the corresponding frame.
  * Return NULL on error.*/
@@ -206,11 +260,33 @@ vm_get_victim (void) {
  * 오류 시 NULL을 반환한다. */
 static struct frame *
 vm_evict_frame (void) {
-	struct frame *victim UNUSED = vm_get_victim ();
 	/* TODO: swap out the victim and return the evicted frame. */
 	/* TODO: victim을 스왑 아웃하고 제거된 프레임을 반환한다. */
+	struct frame *f = vm_get_victim();
+	ASSERT(f != NULL && f->page != NULL);
+	struct page *page = f->page;
+	struct thread *owner = f->owner;
+	void *uva = page->va;
 
-	return NULL;
+	/* 백킹 스토어로 내보내기:
+	*  - anon  : 스왑 슬롯으로 write
+	*  - file  : dirty면 파일에 write-back, 아니면 드롭
+	*  swap_out 과정에서 page->frame->kva를 사용하므로 매핑은 아직 유지 */
+	if (!swap_out(page)) {
+		PANIC("vm_evict_frame: swap_out failed");
+	}
+
+	/* 페이지 테이블 매핑 제거 (dirty/accessed 비트도 함께 소멸) */
+	pml4_clear_page(owner->pml4, uva);
+
+	/* 양방향 연결 해제: 이제 f는 빈 프레임 */
+	page->frame = NULL;
+	f->page = NULL;
+	f->owner = NULL;
+
+	/* 재사용 준비 완료 */
+	f->pinned = false;
+	return f;
 }
 
 /* palloc() and get frame. If there is no available page, evict the page
@@ -226,7 +302,10 @@ vm_get_frame (void) {
 	void *kva = palloc_get_page(PAL_USER);
 
 	// oom시 아직은 패닉으로 처리 나중에 evict로 대체
-	if (kva == NULL) PANIC("vm get frame 실패");
+	if (kva == NULL) {
+		struct frame *f = vm_evict_frame();
+		return f;
+	}
 
 	struct frame *frame = malloc(sizeof *frame);
 	/* TODO: Fill this function. */
@@ -235,6 +314,9 @@ vm_get_frame (void) {
 	ASSERT (frame != NULL);
 	frame->kva = kva;
 	frame->page = NULL;
+	frame->owner = NULL;
+	frame->pinned = false;
+	list_push_back(&frame_table, &frame->elem);
 	// 나중에 프레임에 추가 기능
 	return frame;
 }
@@ -351,6 +433,7 @@ vm_do_claim_page (struct page *page) {
 	/* 페이지와 프레임을 연결한다. */
 	frame->page = page;
 	page->frame = frame;
+	frame->owner = thread_current();
 
 	/* TODO: Insert page table entry to map page's VA to frame's PA. */
 	/* TODO: 페이지의 VA를 프레임의 PA에 매핑하는 페이지 테이블 엔트리를 삽입한다. */

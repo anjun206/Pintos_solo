@@ -67,6 +67,9 @@ struct page {
 struct frame {
 	void *kva;
 	struct page *page;
+	bool pinned;
+	struct thread *owner;
+	struct list_elem elem;
 };
 
 /* The function table for page operations.

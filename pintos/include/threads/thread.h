@@ -142,10 +142,10 @@ struct thread {
 
   struct file *exec_file;   // exec 파일 관리용
   
-#ifdef USERPROG
+// #ifdef USERPROG
   /* Owned by userprog/process.c. */
   uint64_t *pml4; /* Page map level 4 */
-#endif
+// #endif
 #ifdef VM
   /* Table for whole virtual memory owned by thread. */
   struct supplemental_page_table spt;
