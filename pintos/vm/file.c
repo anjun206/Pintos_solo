@@ -101,9 +101,8 @@ static void file_backed_destroy(struct page *page) {
 
 		struct frame *fr = page->frame;   // ★ 보관
 		fr->page = NULL;
-		fr->pinned = false;
 		page->frame = NULL;
-
+		
 		vm_free_frame(fr);                // ★ 제대로 해제
 	}
 	// refcount로 공유 핸들 정리
