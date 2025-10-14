@@ -40,12 +40,12 @@ bool file_backed_initializer(struct page *page, enum vm_type type, void *kva) {
 	page->file.offset = 0;
 	page->file.read_bytes = 0;
 	page->file.zero_bytes = 0;
+	page->writable = true;
 	return true;
 }
 /* Swap in the page by read contents from the file. */
 static bool file_backed_swap_in(struct page *page, void *kva) {
   	struct file_page *file_page UNUSED = &page->file;
-	page->frame->pinned = true;
 	/* 파일->kva로 읽기 */
 	// 락
 	// 파일 읽어오기
@@ -56,16 +56,12 @@ static bool file_backed_swap_in(struct page *page, void *kva) {
 	uint32_t n = file_read_at(file_page->file, kva, file_page->read_bytes, file_page->offset);
 	lock_release(&filesys_lock);
 
-	if (n != (uint32_t)file_page->read_bytes) {
-		page->frame->pinned = false;
-		return false;
-	}
+	if (n != (uint32_t)file_page->read_bytes) return false;
 
 	if (file_page->read_bytes < PGSIZE) {
 		memset((uint8_t *)kva + file_page->read_bytes, 0, PGSIZE - file_page->read_bytes);
 	}
 
-	page->frame->pinned = false;
 	return true;
 }
 
@@ -83,12 +79,10 @@ static bool file_backed_swap_out(struct page *page) {
 	// no dirty
 		// 그냥 보내기
 	// 성공 반환
-	if (pml4_is_dirty(frame->owner->pml4, page->va) && page->writable) {
-		page->frame->pinned = true;
+	if (pml4_is_dirty(frame->owner->pml4, page->va)) {
 		lock_acquire(&filesys_lock);
 		size_t written = file_write_at(file_page->file, kva, file_page->read_bytes, file_page->offset);
 		lock_release(&filesys_lock);
-		page->frame->pinned = false;
 
 		if (written != (size_t)file_page->read_bytes) return false;
 		pml4_set_dirty(frame->owner->pml4, page->va, false);
@@ -103,7 +97,7 @@ static void file_backed_destroy(struct page *page) {
 	struct thread *cur = thread_current();
 
 	// mmap 페이지로 초기화된 경우에만 write-back
-	if (page->frame && file_page->file && page->writable) {
+	if (page->frame && file_page->file != NULL) {
 		if (pml4_is_dirty(cur->pml4, page->va)) {
 			// 페이지가 수정, 기록되었는지(dirty) 확인
 			lock_acquire(&filesys_lock);
@@ -113,10 +107,6 @@ static void file_backed_destroy(struct page *page) {
 			lock_release(&filesys_lock);
 			pml4_set_dirty(cur->pml4, page->va, 0);
 		}
-	}
-	if (file_page->file) {
-		file_close(file_page->file);
-		file_page->file = NULL;
 	}
 
 	pml4_clear_page(cur->pml4, page->va);
@@ -192,7 +182,7 @@ void *do_mmap(void *addr, size_t length, int writable, struct file *file,
 											lazy_load_mmap, aux)) {
 			file_close(aux->file);
 			free(aux);
-			do_munmap(base);
+			do_munmap(upage);
 			// file_close(mmap_file);
 			return NULL;
 		}
@@ -216,30 +206,24 @@ static bool lazy_load_mmap(struct page *page, void *aux_) {
 	struct file_page *init = aux_;
 	*file_page = *init;
 	free(init);
-
 	void *kva = page->frame->kva;
-	page->frame->pinned = true;
 
 	/* 파일에서 필요한 만큼 읽기 */
+	lock_acquire(&filesys_lock);
 	int n = 0;
 	if (file_page->read_bytes > 0) {
-		lock_acquire(&filesys_lock);
 		n = file_read_at(file_page->file, kva, file_page->read_bytes, file_page->offset);
-		lock_release(&filesys_lock);
-
-		if (n != (int)file_page->read_bytes) {
-			page->frame->pinned = false;
-			return false;
-		}
 	}
-	
+	lock_release(&filesys_lock);
+
+	if (file_page->read_bytes > 0 && n != (int)file_page->read_bytes)
+		return false;
 
 	/* 남은 공간 0으로 채우기 */
 	if (file_page->zero_bytes > 0) {
 		memset((uint8_t *)kva + file_page->read_bytes, 0, file_page->zero_bytes);
 	}
 
-	page->frame->pinned = false;
 	return true;
 }
 

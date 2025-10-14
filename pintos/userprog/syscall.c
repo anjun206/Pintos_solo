@@ -50,6 +50,7 @@ void syscall_handler (struct intr_frame *);
 #ifdef VM
 #define STACK_MAX_BYTES   (1u << 20)  /* 1 MiB */
 #define STACK_GROW_SLACK  64          /* RSP 근처 허용 여유 */
+#define MAP_FAILED ((void *) -1);
 #endif
 
 
@@ -504,16 +505,17 @@ system_dup2(int oldfd, int newfd) {
 #ifdef VM
 static void *system_mmap(void *addr, size_t length, int writable, int fd, off_t offset) {
   /* 규격 검증 */
-  if (addr == NULL || length == 0) return NULL;
-  if (pg_ofs(addr) != 0) return NULL;
-  if (offset % PGSIZE != 0) return NULL;
+  if (addr == NULL || length == 0) return MAP_FAILED;
+  if (pg_ofs(addr) != 0) return MAP_FAILED;
+  if (offset % PGSIZE != 0) return MAP_FAILED;
 
+  if (fd <=1 ) return MAP_FAILED;
   struct file *f = fd_get(fd);
-  if (f == NULL) return NULL;
-  if (f == STDIN_FD || f == STDOUT_FD) return NULL;
+  if (f == NULL) return MAP_FAILED;
 
   /* file_reopen은 do_mmap 내부에서 수행하므로 원본 파일로 호출 */
-  return do_mmap(addr, length, writable, f, offset);
+  void *ret = do_mmap(addr, length, writable, f, offset);
+  return ret ? ret : MAP_FAILED;
 }
 
 static void system_munmap(void *addr) {
