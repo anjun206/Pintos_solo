@@ -434,6 +434,7 @@ vm_do_claim_page (struct page *page) {
 	frame->page = page;
 	page->frame = frame;
 	frame->owner = thread_current();
+	frame->pinned = true;
 
 	/* TODO: Insert page table entry to map page's VA to frame's PA. */
 	/* TODO: 페이지의 VA를 프레임의 PA에 매핑하는 페이지 테이블 엔트리를 삽입한다. */
@@ -441,6 +442,7 @@ vm_do_claim_page (struct page *page) {
 	if (!swap_in(page, frame->kva)) {
 		frame->page = NULL;
 		page->frame = NULL;
+		frame->pinned = false;
 		vm_free_frame(frame);
 		return false;
 	}
@@ -448,9 +450,11 @@ vm_do_claim_page (struct page *page) {
 	if (!pml4_set_page(cur->pml4, page->va, frame->kva, page->writable)) {
 		frame->page = NULL;
 		page->frame = NULL;
+		frame->pinned = false;
 		vm_free_frame(frame);
 		return false;
 	}
+	frame->pinned = false;
 	return true;
 }
 

@@ -50,7 +50,7 @@ void syscall_handler (struct intr_frame *);
 #ifdef VM
 #define STACK_MAX_BYTES   (1u << 20)  /* 1 MiB */
 #define STACK_GROW_SLACK  64          /* RSP 근처 허용 여유 */
-#define MAP_FAILED ((void *) -1);
+#define MAP_FAILED ((void *) NULL);
 #endif
 
 
