@@ -502,17 +502,40 @@ system_dup2(int oldfd, int newfd) {
 }
 
 #ifdef VM
+static void *find_unmapped_region(size_t length) {
+  size_t pages = (length + PGSIZE - 1) / PGSIZE;
+  struct thread *t = thread_current();
+
+  /* 너무 낮은 쪽은 피하고 적당히 낮은 베이스에서 위로 스캔 */
+  uint8_t *base = (uint8_t *)0x10000000;  // 임의의 user 영역 시작 힌트
+  for (;;) {
+    void *cand = base;
+    size_t i;
+    for (i = 0; i < pages; i++) {
+      if (!is_user_vaddr(cand)) return NULL;                 // 끝까지 못 찾음
+      if (spt_find_page(&t->spt, cand) != NULL) break;       // 겹침
+      cand += PGSIZE;
+    }
+    if (i == pages) return base;                             // 성공
+    base += PGSIZE;                                          // 다음 후보
+  }
+}
+
 static void *system_mmap(void *addr, size_t length, int writable, int fd, off_t offset) {
-  /* 규격 검증 */
-  if (addr == NULL || length == 0) return NULL;
-  if (pg_ofs(addr) != 0) return NULL;
+  if (length == 0) return NULL;
   if (offset % PGSIZE != 0) return NULL;
 
-  struct file *f = fd_get(fd);
-  if (f == NULL) return NULL;
-  if (f == STDIN_FD || f == STDOUT_FD) return NULL;
+  if (addr != NULL && pg_ofs(addr) != 0) return NULL;
 
-  /* file_reopen은 do_mmap 내부에서 수행하므로 원본 파일로 호출 */
+  struct file *f = fd_get(fd);
+  if (f == NULL || f == STDIN_FD || f == STDOUT_FD) return NULL;
+
+  /* addr == NULL이면 커널이 배치 */
+  if (addr == NULL) {
+    addr = find_unmapped_region(length);
+    if (addr == NULL) return NULL;
+  }
+
   return do_mmap(addr, length, writable, f, offset);
 }
 

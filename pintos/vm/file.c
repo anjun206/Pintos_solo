@@ -150,7 +150,9 @@ void *do_mmap(void *addr, size_t length, int writable, struct file *file,
 		// aux 생성
 		struct file_page *aux = malloc(sizeof *aux);
 		if (!aux) {
-			do_munmap(upage);
+			do_munmap(base);
+			// file_close(ctx->file);        // refcnt==0이면 우리가 직접 닫아야 함
+      		// free(ctx);
 			return NULL;
 		};
 
@@ -171,9 +173,7 @@ void *do_mmap(void *addr, size_t length, int writable, struct file *file,
 		if (!vm_alloc_page_with_initializer(VM_FILE, upage, writable,
 											lazy_load_mmap, aux)) {
 			free(aux);
-			do_munmap(upage);
-			file_close(aux->file);
-			free(ctx);
+			do_munmap(base);
 			return NULL;
 		}
 
