@@ -14,6 +14,8 @@ static bool file_backed_swap_out(struct page *page);
 static void file_backed_destroy(struct page *page);
 static bool lazy_load_mmap(struct page *page, void *aux_);
 
+extern struct lock filesys_lock;
+
 /* DO NOT MODIFY this struct */
 static const struct page_operations file_ops = {
     .swap_in = file_backed_swap_in,
@@ -38,14 +40,52 @@ bool file_backed_initializer(struct page *page, enum vm_type type, void *kva) {
   page->file.zero_bytes = 0;
   return true;
 }
+
 /* Swap in the page by read contents from the file. */
 static bool file_backed_swap_in(struct page *page, void *kva) {
-  struct file_page *file_page UNUSED = &page->file;
+  	struct file_page *file_page UNUSED = &page->file;
+	/* 파일->kva로 읽기 */
+	// 락
+	// 파일 읽어오기
+	// 락
+	// 빈곳 0으로 채우기
+	// 성공 반환
+	lock_acquire(&filesys_lock);
+	uint32_t n = file_read_at(file_page->file, kva, file_page->read_bytes, file_page->offset);
+	lock_release(&filesys_lock);
+
+	if (n != (uint32_t)file_page->read_bytes) return false;
+
+	if (file_page->read_bytes < PGSIZE) {
+		memset((uint8_t *)kva + file_page->read_bytes, 0, PGSIZE - file_page->read_bytes);
+	}
+
+	return true;
 }
 
 /* Swap out the page by writeback contents to the file. */
 static bool file_backed_swap_out(struct page *page) {
-  struct file_page *file_page UNUSED = &page->file;
+  	struct file_page *file_page UNUSED = &page->file;
+	struct frame *frame = page->frame;
+	void *kva = frame->kva;
+	// dirty?
+		// lock
+		// 파일에 쓰기
+		// lock
+		// dirty!
+	// no dirty
+		// 그냥 보내기
+	// 성공 반환
+	if (pml4_is_dirty(frame->owner->pml4, page->va)) {
+		lock_acquire(&filesys_lock);
+		size_t written = file_write_at(file_page->file, kva, file_page->read_bytes, file_page->offset);
+		lock_release(&filesys_lock);
+
+		if (written != (size_t)file_page->read_bytes) return false;
+		pml4_set_dirty(frame->owner->pml4, page->va, false);
+	}
+
+	return true;
 }
 
 /* Destory the file backed page. PAGE will be freed by the caller. */
