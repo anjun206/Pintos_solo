@@ -16,8 +16,6 @@ static struct list frame_table;            /* 모든 프레임을 담는 전역 
 static struct list_elem *clock_hand;       /* 시계바늘 */
 static struct lock frame_table_lock;       /* 프레임 테이블 보호 락 */
 
-static struct lock filesys_lock;
-
 #ifdef VM
 /* process.c의 struct load_aux와 동일한 레이아웃 (미러 선언) */
 struct load_aux {

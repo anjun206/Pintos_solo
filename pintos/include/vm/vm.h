@@ -48,6 +48,7 @@ struct page {
   	struct hash_elem spt_elem;  // SPT 키
 
 	bool writable;	// 매핑용
+	struct pml4 *pml4;
 
 	/* Your implementation */
 
