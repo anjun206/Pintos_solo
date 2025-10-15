@@ -19,6 +19,11 @@
 #include "threads/synch.h"
 #include "list.h"
 #include "lib/kernel/hash.h"
+#ifdef VM
+#include "vm/vm.h"
+#include "vm/file.h"
+#endif
+
 
 struct lock filesys_lock;
 
@@ -41,6 +46,13 @@ void syscall_handler (struct intr_frame *);
 
 #define STDIN_FD  ((struct file*)-1)
 #define STDOUT_FD ((struct file*)-2)
+
+#ifdef VM
+#define STACK_MAX_BYTES   (1u << 20)  /* 1 MiB */
+#define STACK_GROW_SLACK  64          /* RSP 근처 허용 여유 */
+#endif
+
+
 
 /* 프로토 타입 */
 static void system_halt(void) NO_RETURN;
@@ -66,6 +78,11 @@ static unsigned system_tell(int fd);
 
 static int system_dup2(int oldfd, int newfd);
 
+#ifdef VM
+static void *system_mmap(void *addr, size_t length, int writable, int fd, off_t offset);
+static void  system_munmap(void *addr);
+#endif
+
 /* 시스템콜 헬퍼 */
 static struct file *fd_get(int fd);
 static void assert_user_range(const void *uaddr, size_t size);
@@ -77,6 +94,60 @@ static int  fd_alloc(struct file *f);   // 빈 슬롯 찾아 file* 넣고 fd 반
 static unsigned file_ref_hash(const struct hash_elem *e, void *aux);
 static bool file_ref_less(const struct hash_elem *a, const struct hash_elem *b, void *aux);
 static struct file_ref *ref_find(struct file *fp);
+
+/* vm 헬퍼 */
+#ifdef VM
+static uint8_t *
+kmap_user_addr_or_claim(const void *uaddr, bool for_write) {
+  struct thread *t = thread_current();
+  if (uaddr == NULL || !is_user_vaddr(uaddr)) system_exit(-1);
+
+  void *upg = pg_round_down(uaddr);
+
+  /* 1) 이미 매핑되어 있으면 그대로 반환 */
+  void *kp = pml4_get_page(t->pml4, upg);
+  if (kp != NULL) {
+    struct page *p = spt_find_page(&t->spt, upg);
+    if (for_write && p && !p->writable) system_exit(-1);
+    return (uint8_t *)kp + pg_ofs(uaddr);
+  }
+
+  /* 2) SPT에 등록된 페이지면 claim해서 매핑 */
+  struct page *p = spt_find_page(&t->spt, upg);
+  if (p != NULL) {
+    if (for_write && !p->writable) system_exit(-1);
+    if (!vm_claim_page(upg)) system_exit(-1);
+    kp = pml4_get_page(t->pml4, upg);
+    if (kp == NULL) system_exit(-1);
+    return (uint8_t *)kp + pg_ofs(uaddr);
+  }
+
+  /* 3) (핵심) 스택 성장 허용: 쓰기 상황 + 스택 창 + RSP 근처 */
+  uintptr_t ua     = (uintptr_t)uaddr;
+  uintptr_t upg_a  = (uintptr_t)upg;
+  uintptr_t rsp    = (uintptr_t)t->user_rsp;
+
+  bool in_stack_window =
+      upg_a >= (uintptr_t)USER_STACK - (uintptr_t)STACK_MAX_BYTES &&
+      upg_a <  (uintptr_t)USER_STACK;
+
+  bool near_rsp =
+      (ua + 8) >= (rsp - STACK_GROW_SLACK) && ua < (uintptr_t)USER_STACK;
+
+  if (for_write && in_stack_window && near_rsp) {
+    if (!vm_alloc_page(VM_ANON | VM_MARKER_0, upg, true)) system_exit(-1);
+    if (!vm_claim_page(upg)) system_exit(-1);
+    kp = pml4_get_page(t->pml4, upg);
+    if (kp == NULL) system_exit(-1);
+    return (uint8_t *)kp + pg_ofs(uaddr);
+  }
+
+  /* 스택 후보가 아니거나, RSP에서 너무 멀면 잘못된 접근 */
+  system_exit(-1);
+  __builtin_unreachable();
+}
+#endif
+
 
 // dup2
 struct file_ref {
@@ -138,6 +209,7 @@ syscall_init (void) {
 /* 주요 시스템 콜 인터페이스 */
 /* 개쩌는 가시성 (아님) */
 void syscall_handler(struct intr_frame *f) {
+  thread_current()->user_rsp = f->rsp;
   switch (SC_NO(f)) {
     case SYS_HALT:   system_halt(); __builtin_unreachable();
     case SYS_EXIT:   system_exit((int)ARG0(f)); __builtin_unreachable();
@@ -163,6 +235,12 @@ void syscall_handler(struct intr_frame *f) {
 
     /* dup2 extra 과제 */
     case SYS_DUP2:   RET(f, system_dup2((int)ARG0(f), (int)ARG1(f))); break;
+
+#ifdef VM
+    case SYS_MMAP:   RET(f, system_mmap((void *)ARG0(f), (size_t)ARG1(f), (int)ARG2(f),
+                        (int)ARG3(f), (off_t)ARG4(f))); break;
+    case SYS_MUNMAP: system_munmap((void *)ARG0(f)); break;
+#endif
 
     default:         system_exit(-1); __builtin_unreachable();
   }
@@ -423,6 +501,30 @@ system_dup2(int oldfd, int newfd) {
   return newfd;
 }
 
+#ifdef VM
+static void *system_mmap(void *addr, size_t length, int writable, int fd, off_t offset) {
+  /* 규격 검증 */
+  if (addr == NULL || length == 0) return NULL;
+  if (pg_ofs(addr) != 0) return NULL;
+  if (offset % PGSIZE != 0) return NULL;
+
+  struct file *f = fd_get(fd);
+  if (f == NULL) return NULL;
+  if (f == STDIN_FD || f == STDOUT_FD) return NULL;
+
+  /* file_reopen은 do_mmap 내부에서 수행하므로 원본 파일로 호출 */
+  return do_mmap(addr, length, writable, f, offset);
+}
+
+static void system_munmap(void *addr) {
+  if (addr == NULL) return;
+  do_munmap(addr);
+}
+#endif
+
+
+/* -------------------------- */
+
 // fd 뽑아보기
 static struct
 file *fd_get(int fd) {
@@ -436,14 +538,18 @@ static void
 assert_user_range(const void *uaddr, size_t size) {
   if (uaddr == NULL) system_exit(-1);
   if (size == 0) return;
+
   const uint8_t *begin = (const uint8_t *)uaddr;
   const uint8_t *end   = begin + size - 1;
 
   // 범위를 페이지 경계 단위로 훑는다
   for (const uint8_t *p = pg_round_down(begin); p <= end; p += PGSIZE) {
-    if (!is_user_vaddr(p)) system_exit(-1);                 // 유저 주소 맞는지 체크
-    if (pml4_get_page(thread_current()->pml4, p) == NULL)   // p매핑 pml4에 되어있는지 체크
-      system_exit(-1);
+#ifdef VM
+    (void)kmap_user_addr_or_claim(p, false);
+#else
+    if (!is_user_vaddr(p)) system_exit(-1);
+    if (pml4_get_page(thread_current()->pml4, p) == NULL) system_exit(-1);
+#endif
   }
 }
 
@@ -455,12 +561,19 @@ copy_in_string(char *kdst, const char *usrc, size_t max_len) {
   while (i < max_len) {
     const uint8_t *u = (const uint8_t *)usrc + i;
 
+#ifdef VM
+    uint8_t *ksrc = kmap_user_addr_or_claim(u, false);
+
+#else
     if (!is_user_vaddr(u)) system_exit(-1);
 
     void *kp = pml4_get_page(thread_current()->pml4, pg_round_down(u));
     if (kp == NULL) system_exit(-1);
+    uint8_t *ksrc = (uint8_t *)kp + pg_ofs(u);
+#endif
 
-    char c = *(((char *)kp) + pg_ofs(u));  // base + ofs 로 1바이트 읽기
+
+    char c = *(char *)ksrc;
     kdst[i++] = c;
     if (c == '\0') return true;  // 정상 종료: 제한 내에서 NUL 발견
   }
@@ -475,15 +588,17 @@ copy_in(void *kdst, const void *usrc, size_t n) {
   const uint8_t *u = (const uint8_t *)usrc;
 
   while (n > 0) {
-    if (!is_user_vaddr(u)) system_exit(-1);
-
-    const void *kp = pml4_get_page(thread_current()->pml4, pg_round_down(u));
-    if (kp == NULL) system_exit(-1);
-
-    const uint8_t *ksrc = (const uint8_t *)kp + pg_ofs(u);
-
     size_t chunk = PGSIZE - pg_ofs(u);
     if (chunk > n) chunk = n;
+
+#ifdef VM
+    uint8_t *ksrc = kmap_user_addr_or_claim(u, false);
+#else
+    if (!is_user_vaddr(u)) system_exit(-1);
+    void *kp = pml4_get_page(thread_current()->pml4, pg_round_down(u));
+    if (kp == NULL) system_exit(-1);
+    uint8_t *ksrc = (uint8_t *)kp + pg_ofs(u);
+#endif
 
     memcpy(kd, ksrc, chunk);
     kd += chunk;
@@ -498,15 +613,17 @@ copy_out(void *udst, const void *ksrc, size_t n) {
   const uint8_t *k = (const uint8_t *)ksrc;
 
   while (n > 0) {
-    if (!is_user_vaddr(u)) system_exit(-1);
-
-    void *kp = pml4_get_page(thread_current()->pml4, pg_round_down(u));
-    if (kp == NULL) system_exit(-1);
-
-    uint8_t *kdst = (uint8_t *)kp + pg_ofs(u);
-
     size_t chunk = PGSIZE - pg_ofs(u);
     if (chunk > n) chunk = n;
+
+#ifdef VM
+    uint8_t *kdst = kmap_user_addr_or_claim(u, /*for_write=*/true);
+#else
+    if (!is_user_vaddr(u)) system_exit(-1);
+    void *kp = pml4_get_page(thread_current()->pml4, pg_round_down(u));
+    if (kp == NULL) system_exit(-1);
+    uint8_t *kdst = (uint8_t *)kp + pg_ofs(u);
+#endif
 
     memcpy(kdst, k, chunk);
     u += chunk;

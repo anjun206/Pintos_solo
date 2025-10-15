@@ -25,7 +25,10 @@
 #include "lib/kernel/hash.h"
 #ifdef VM
 #include "vm/vm.h"
+#include "vm/file.h"
 #endif
+
+extern struct lock filesys_lock;
 
 static void process_cleanup (void);
 static bool load (const char *file_name, struct intr_frame *if_);
@@ -46,7 +49,7 @@ struct fork_args {
 	struct intr_frame parent_if;  // 사본으로 전달
 	struct child_status *cs;
 };
-
+	
 /* 제대로된 dup2 */
 struct dupmap_ent {
 	struct file *parent_fp;         // 키
@@ -72,6 +75,9 @@ process_init (void) {
 	struct thread *current = thread_current ();
 	if (!current->proc_inited) {
 		list_init(&current->children);
+#ifdef VM
+    	list_init(&current->mmap_list);
+#endif
 		current->proc_inited = true;
 	}
 }
@@ -170,10 +176,6 @@ process_create_initd (const char *file_name) {
 /* 첫 사용자 프로세스를 시작하는 스레드 함수. */
 static void
 initd (void *aux_) {
-#ifdef VM
-	supplemental_page_table_init (&thread_current ()->spt);
-#endif
-
 	process_init ();
 
 	struct exec_info *ei = aux_;
@@ -340,7 +342,10 @@ __do_fork (void *aux) {
 	process_activate (current);
 #ifdef VM
 	supplemental_page_table_init (&current->spt);
-	if (!supplemental_page_table_copy (&current->spt, &parent->spt))
+    if (parent->exec_file)
+      current->exec_file = file_duplicate(parent->exec_file);
+    if (!supplemental_page_table_copy (&current->spt, &parent->spt,
+                                       parent->exec_file, current->exec_file))
 		goto error;
 #else
 	if (!pml4_for_each (parent->pml4, duplicate_pte, parent))
@@ -469,6 +474,10 @@ process_exec (void *f_name) {
 	_if.eflags = FLAG_IF | FLAG_MBS;
 
 	process_cleanup();
+
+#ifdef VM
+  	supplemental_page_table_init(&t->spt);
+#endif
 
 	/* 커맨드라인 토큰화: prog + argv[] */
 	char *save_ptr;
@@ -647,29 +656,36 @@ process_exit (void) {
 	 * TODO: 프로세스 자원 해제를 여기에서 구현하는 것을 권장한다. */
 	struct thread *cur = thread_current ();
 
+#ifdef VM
+	/* 먼저 모든 mmap 암묵 해제 */
+	while (!list_empty(&cur->mmap_list)) {
+		struct mmap_file *mm = list_entry(list_front(&cur->mmap_list), struct mmap_file, elem);
+		do_munmap(mm->base);
+	}
+#endif
 
-		if (cur->fd_table) {
-			for (int i = 0; i < cur->fd_cap; i++) {
-				struct file *p = cur->fd_table ? cur->fd_table[i] : NULL;
-				if (!p) continue;
-				cur->fd_table[i] = NULL;
-				fdref_dec(p);
-			}
+	if (cur->fd_table) {
+		for (int i = 0; i < cur->fd_cap; i++) {
+			struct file *p = cur->fd_table ? cur->fd_table[i] : NULL;
+			if (!p) continue;
+			cur->fd_table[i] = NULL;
+			fdref_dec(p);
 		}
+	}
 
-		if (cur->exec_file) {
-			file_allow_write(cur->exec_file);
-			file_close(cur->exec_file);
-			cur->exec_file = NULL;
-		}
+	if (cur->exec_file) {
+		file_allow_write(cur->exec_file);
+		file_close(cur->exec_file);
+		cur->exec_file = NULL;
+	}
 
-		if (cur->fd_table) {
-			if (cur->fd_table_from_palloc) palloc_free_page(cur->fd_table);
-			else free(cur->fd_table);
-			cur->fd_table = NULL;
-			cur->fd_cap = 0;
-			cur->fd_table_from_palloc = false;
-		}
+	if (cur->fd_table) {
+		if (cur->fd_table_from_palloc) palloc_free_page(cur->fd_table);
+		else free(cur->fd_table);
+		cur->fd_table = NULL;
+		cur->fd_cap = 0;
+		cur->fd_table_from_palloc = false;
+	}
 
 	/* 유저 프로세스 에서만 */
 	if (cur->proc_inited) {
@@ -851,7 +867,9 @@ load (const char *file_name, struct intr_frame *if_) {
 
 	/* Open executable file. */
 	/* 실행 파일을 연다. */
+	lock_acquire(&filesys_lock);
 	file = filesys_open (file_name);
+	lock_release(&filesys_lock);
 	if (file == NULL) {
 		printf ("load: %s: open failed\n", file_name);
 		goto done;
@@ -859,6 +877,7 @@ load (const char *file_name, struct intr_frame *if_) {
 
 	/* Read and verify executable header. */
 	/* 실행 파일 헤더를 읽고 검증한다. */
+	lock_acquire(&filesys_lock);
 	if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
 			|| memcmp (ehdr.e_ident, "\177ELF\2\1\1", 7)
 			|| ehdr.e_type != 2
@@ -870,6 +889,7 @@ load (const char *file_name, struct intr_frame *if_) {
 		printf ("load: %s: error loading executable\n", file_name);
 		goto done;
 	}
+	lock_release(&filesys_lock);
 
 	/* Read program headers. */
 	/* 프로그램 헤더들을 읽는다. */
@@ -877,12 +897,20 @@ load (const char *file_name, struct intr_frame *if_) {
 	for (i = 0; i < ehdr.e_phnum; i++) {
 		struct Phdr phdr;
 
-		if (file_ofs < 0 || file_ofs > file_length (file))
-			goto done;
+		lock_acquire(&filesys_lock);
+		off_t flen = file_length (file);
+		lock_release(&filesys_lock);
+		if (file_ofs < 0 || file_ofs > flen)
+    		goto done;
+
+		lock_acquire(&filesys_lock);
 		file_seek (file, file_ofs);
 
-		if (file_read (file, &phdr, sizeof phdr) != sizeof phdr)
+		if (file_read (file, &phdr, sizeof phdr) != sizeof phdr) {
+			lock_release(&filesys_lock);
 			goto done;
+		}
+		lock_release(&filesys_lock);
 		file_ofs += sizeof phdr;
 		switch (phdr.p_type) {
 			case PT_NULL:
@@ -944,7 +972,9 @@ load (const char *file_name, struct intr_frame *if_) {
 	/* TODO: 여기에 코드를 작성한다.
 	 * TODO: 인자 전달을 구현하라 (project2/argument_passing.html 참고). */
 	t->exec_file = file;
+	lock_acquire(&filesys_lock);
 	file_deny_write(file);
+	lock_release(&filesys_lock);
 	file = NULL;
 
 	success = true;
@@ -1156,32 +1186,35 @@ install_page (void *upage, void *kpage, bool writable) {
 
 static bool
 lazy_load_segment (struct page *page, void *aux_) {
-	/* TODO: Load the segment from the file */
-	/* TODO: 파일에서 세그먼트를 적재한다. */
-
-	/* TODO: This called when the first page fault occurs on address VA. */
-	/* TODO: 이 함수는 VA에서 최초의 페이지 폴트가 발생했을 때 호출된다. */
-
-	/* TODO: VA is available when calling this function. */
-	/* TODO: 이 함수를 호출할 때 VA는 유효하다. */
-
 	struct load_aux *aux = aux_;
 	void *kva = page->frame->kva;
+	struct file_page *file_page = &page->file;
+	size_t read_bytes = aux->read_bytes;
+	size_t zero_bytes = PGSIZE - read_bytes;
 
-	/* 파일에서 필요한 만큼 읽기 */
-	if (aux->read_bytes > 0) {
-		int n = file_read_at(aux->file, kva, aux->read_bytes, aux->ofs);
-		if (n != (int)aux->read_bytes) {
+	if (read_bytes > 0) {
+		lock_acquire(&filesys_lock);
+		int n = file_read_at(aux->file, kva, read_bytes, aux->ofs);
+		lock_release(&filesys_lock);
+		if (n != (int)read_bytes) {
 			free(aux);
 			return false;
 		}
-  	}
+	}
 
-	/* 남은 공간 0으로 채우기 */
-  	if (aux->zero_bytes > 0) {
-    	memset((uint8_t *)kva + aux->read_bytes, 0, aux->zero_bytes);
-  	}
-	
+	if (zero_bytes > 0) {
+		memset((uint8_t *)kva + read_bytes, 0, zero_bytes);
+	}
+
+	if (read_bytes == PGSIZE) {
+		file_page->file = aux->file;
+		file_page->offset = aux->ofs;
+		file_page->read_bytes = read_bytes;
+		file_page->zero_bytes = zero_bytes;
+	} else {
+		anon_initializer(page, VM_ANON, kva);
+	}
+
 	free(aux);
 	return true;
 }
@@ -1232,14 +1265,15 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 		/* TODO: lazy_load_segment에 정보를 전달하기 위한 aux를 설정한다. */
 		struct load_aux *aux = malloc(sizeof *aux);
 		if (!aux) return false;
-		aux->file = file;
+		// aux->file = file_reopen(file);
+		// if (aux->file == NULL) { free(aux); return false; }
+		aux->file = file;                 // ★ 실행파일 핸들을 '공유'한다 (reopen/dup X).
 		aux->ofs  = ofs;
 		aux->read_bytes = page_read_bytes;
 		aux->zero_bytes = page_zero_bytes;
-
 		/* 파일-백드 페이지로 lazy 등록 */
 		if (!vm_alloc_page_with_initializer(VM_FILE, upage, writable,
-											lazy_load_segment, aux)) {
+ 							lazy_load_segment, aux)) {
 			free(aux);
 			return false;
 		}
@@ -1277,6 +1311,9 @@ setup_stack (struct intr_frame *if_) {
 	/* 즉시 클레임 */
 	if (!vm_claim_page(stack_bottom))
 		return false;
+
+	volatile uint8_t *probe = (uint8_t *)((uint8_t*)USER_STACK - 1);
+	*probe = 0; 
 
 	if_->rsp = USER_STACK;
   	success = true;
