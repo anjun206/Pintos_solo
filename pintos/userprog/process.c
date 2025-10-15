@@ -1197,6 +1197,7 @@ lazy_load_segment (struct page *page, void *aux_) {
 
 	struct load_aux *aux = aux_;
 	void *kva = page->frame->kva;
+	struct file_page *file_page = &page->file;
 
 	/* 파일에서 필요한 만큼 읽기 */
 	if (aux->read_bytes > 0) {
@@ -1204,16 +1205,26 @@ lazy_load_segment (struct page *page, void *aux_) {
 		int n = file_read_at(aux->file, kva, aux->read_bytes, aux->ofs);
 		lock_release(&filesys_lock);
 		if (n != (int)aux->read_bytes) {
-			// file_close(aux->file);
 			free(aux);
 			return false;
 		}
   	}
 
 	/* 남은 공간 0으로 채우기 */
-  	if (aux->zero_bytes > 0) {
+	if (aux->zero_bytes > 0) {
     	memset((uint8_t *)kva + aux->read_bytes, 0, aux->zero_bytes);
   	}
+
+	/* 메타데이터 저장: swap 시 재로딩에 필요 */
+	if (aux->read_bytes == PGSIZE) {
+		file_page->file = aux->file;
+		file_page->offset = aux->ofs;
+		file_page->read_bytes = aux->read_bytes;
+		file_page->zero_bytes = aux->zero_bytes;
+	} else {
+		/* 파일이 온전히 backing 하지 못하는 페이지(부분 읽기/zero page)는 익명으로 전환 */
+		anon_initializer(page, VM_ANON, kva);
+	}
 	
 	// file_close(aux->file);
 	free(aux);

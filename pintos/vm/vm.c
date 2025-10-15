@@ -13,6 +13,7 @@
 #define STACK_MAX_BYTES (1 << 20)  // 스택 성장 한계
 
 extern struct lock filesys_lock;
+static struct lock frame_lock;
 
 #ifdef VM
 /* process.c의 struct load_aux와 동일한 레이아웃 (미러 선언) */
@@ -23,6 +24,9 @@ struct load_aux {
   size_t zero_bytes;
 };
 #endif
+
+struct list frame_table;
+struct list_elem *start;
 
 static uint64_t spt_hash(const struct hash_elem *e, void *aux) {
   const struct page *p = hash_entry(e, struct page, spt_elem);
@@ -70,6 +74,9 @@ vm_init (void) {
 	/* 위의 줄은 수정하지 말 것. */
 	/* TODO: Your code goes here. */
 	/* TODO: 여기에 코드를 작성하라. */
+	list_init(&frame_table);
+	lock_init(&frame_lock);
+	start = list_begin(&frame_table);
 }
 
 /* Get the type of the page. This function is useful if you want to know the
@@ -142,6 +149,7 @@ vm_alloc_page_with_initializer (enum vm_type type, void *upage, bool writable,
 		uninit_new(page, upage, init, type, aux, type_init);
 
 		page->writable = writable;
+		page->owner = thread_current();
 
 		/* TODO: Insert the page into the spt. */
 		/* TODO: 페이지를 보조 페이지 테이블에 삽입한다. */
@@ -196,7 +204,27 @@ vm_get_victim (void) {
 	struct frame *victim = NULL;
 	 /* TODO: The policy for eviction is up to you. */
 	 /* TODO: 어떤 프레임을 제거할지 결정하는 정책은 직접 구현한다. */
+	struct thread *curr = thread_current();
+	struct list_elem *e = start;
 
+	/*  */
+	for (start = e; start != list_end(&frame_table); start = list_next(start))
+	{
+		victim = list_entry(start, struct frame, frame_elem);
+		if (pml4_is_accessed(curr->pml4, victim->page->va))
+			pml4_set_accessed(curr->pml4, victim->page->va, 0);
+		else
+			return victim;
+	}
+
+	for (start = list_begin(&frame_table); start != e; start = list_next(start))
+	{
+		victim = list_entry(start, struct frame, frame_elem);
+		if (pml4_is_accessed(curr->pml4, victim->page->va))
+			pml4_set_accessed(curr->pml4, victim->page->va, 0);
+		else
+			return victim;
+	}
 	return victim;
 }
 
@@ -206,11 +234,26 @@ vm_get_victim (void) {
  * 오류 시 NULL을 반환한다. */
 static struct frame *
 vm_evict_frame (void) {
-	struct frame *victim UNUSED = vm_get_victim ();
+	struct frame *victim UNUSED = vm_get_victim();
 	/* TODO: swap out the victim and return the evicted frame. */
-	/* TODO: victim을 스왑 아웃하고 제거된 프레임을 반환한다. */
+	if (victim == NULL) return NULL;
+	struct page *page = victim->page;
+	ASSERT(page != NULL);
 
-	return NULL;
+	if (!swap_out(page)) {
+		list_push_back(&frame_table, &victim->frame_elem);
+		return NULL;
+	}
+
+	/* 매핑 제거는 여기서 일관되게 처리
+	* dirty 판단 후 바로 매핑 끊기
+	*/
+	if (page->owner && page->owner->pml4)
+		pml4_clear_page(page->owner->pml4, page->va);
+
+	page->frame = NULL;
+	victim->page = NULL;
+	return victim;
 }
 
 /* palloc() and get frame. If there is no available page, evict the page
@@ -223,14 +266,18 @@ vm_evict_frame (void) {
  * 즉, 사용자 풀 메모리가 가득 찼을 경우 이 함수는 프레임을 제거해 가용 메모리를 확보한다. */
 static struct frame *
 vm_get_frame (void) {
+	struct frame *frame = (struct frame *)malloc(sizeof(struct frame));
 	void *kva = palloc_get_page(PAL_USER);
 
 	// oom시 아직은 패닉으로 처리 나중에 evict로 대체
-	if (kva == NULL) PANIC("vm get frame 실패");
+	if (kva == NULL) {
+		frame = vm_evict_frame();
+		frame->page = NULL;
 
-	struct frame *frame = malloc(sizeof *frame);
-	/* TODO: Fill this function. */
-	/* TODO: 이 함수를 구현하라. */
+		return frame;
+	}
+
+	list_push_back (&frame_table, &frame->frame_elem);  
 
 	ASSERT (frame != NULL);
 	frame->kva = kva;
@@ -317,8 +364,26 @@ vm_try_handle_fault (struct intr_frame *f, void *addr,
  * 이 함수는 수정하지 말 것. */
 void
 vm_dealloc_page (struct page *page) {
-	destroy (page);
-	free (page);
+	struct thread *owner = page->owner;
+
+	/* 매핑이 살아있으면 먼저 끊기 */
+	if (owner && owner->pml4) pml4_clear_page(owner->pml4, page->va);
+
+	/* 프레임 보유 중이면 프레임 테이블에서 빼고 반환 */
+	if (page->frame) {
+		struct frame *f = page->frame;
+		page->frame = NULL;
+		if (f->page == page) f->page = NULL;
+
+		lock_acquire(&frame_lock);
+		list_remove(&f->frame_elem);
+		lock_release(&frame_lock);
+
+		vm_free_frame(f);  // palloc_free_page + free
+	}
+
+	destroy(page);
+	free(page);
 }
 
 /* Claim the page that allocate on VA. */

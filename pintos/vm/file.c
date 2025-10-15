@@ -1,18 +1,19 @@
 /* file.c: Implementation of memory backed file object (mmaped object). */
 
-#include "filesys/file.h"
+#include "vm/file.h"
 
 #include <string.h>
 
 #include "threads/mmu.h"
 #include "threads/vaddr.h"
 #include "userprog/process.h"
-#include "vm/vm.h"
 
 static bool file_backed_swap_in(struct page *page, void *kva);
 static bool file_backed_swap_out(struct page *page);
 static void file_backed_destroy(struct page *page);
 static bool lazy_load_mmap(struct page *page, void *aux_);
+
+extern struct lock filesys_lock;
 
 /* DO NOT MODIFY this struct */
 static const struct page_operations file_ops = {
@@ -38,14 +39,50 @@ bool file_backed_initializer(struct page *page, enum vm_type type, void *kva) {
   page->file.zero_bytes = 0;
   return true;
 }
+
 /* Swap in the page by read contents from the file. */
 static bool file_backed_swap_in(struct page *page, void *kva) {
-  struct file_page *file_page UNUSED = &page->file;
+	struct file_page *file_page UNUSED = &page->file;
+
+	
+	if (file_page->read_bytes > 0) {
+		if (file_page->file == NULL) return false;
+		lock_acquire(&filesys_lock);
+		off_t n = file_read_at(file_page->file, kva,
+							file_page->read_bytes, file_page->offset);
+		lock_release(&filesys_lock);
+		if (n != (off_t)file_page->read_bytes) {
+			return false;
+		}
+	}
+
+	if (file_page->zero_bytes > 0) {
+		memset((uint8_t *)kva + file_page->read_bytes,
+			0, file_page->zero_bytes);
+	}
+
+	return true;
 }
 
 /* Swap out the page by writeback contents to the file. */
 static bool file_backed_swap_out(struct page *page) {
-  struct file_page *file_page UNUSED = &page->file;
+	struct file_page *file_page UNUSED = &page->file;
+	struct frame *frame = page->frame;
+	struct thread *owner = page->owner;
+	if (!frame || !owner) return true;
+
+	bool dirty = pml4_is_dirty(owner->pml4, page->va);
+	if (dirty && file_page->file) {
+		lock_acquire(&filesys_lock);
+		off_t written = file_write_at(file_page->file, frame->kva,
+									file_page->read_bytes, file_page->offset);
+		lock_release(&filesys_lock);
+		if (written != (off_t)file_page->read_bytes) return false;
+		pml4_set_dirty(owner->pml4, page->va, false);
+	}
+
+	/* 매핑 제거는 vm_evict_frame()이 일괄 처리 */
+	return true;
 }
 
 /* Destory the file backed page. PAGE will be freed by the caller. */
@@ -154,32 +191,32 @@ void *do_mmap(void *addr, size_t length, int writable, struct file *file,
 }
 
 static bool lazy_load_mmap(struct page *page, void *aux_) {
-  ASSERT(page != NULL);
-  ASSERT(page->frame != NULL);
+	ASSERT(page != NULL);
+	ASSERT(page->frame != NULL);
 
-  // struct file_page *file_page = &page->file;
-  // void *kva = page->frame->kva;
-  struct file_page *file_page = &page->file;
-  struct file_page *init = aux_;
-  *file_page = *init;
-  free(init);
-  void *kva = page->frame->kva;
+	// struct file_page *file_page = &page->file;
+	// void *kva = page->frame->kva;
+	struct file_page *file_page = &page->file;
+	struct file_page *init = aux_;
+	*file_page = *init;
+	free(init);
+	void *kva = page->frame->kva;
 
-  /* 파일에서 필요한 만큼 읽기 */
-  if (file_page->read_bytes > 0) {
-    int n = file_read_at(file_page->file, kva, file_page->read_bytes,
-                         file_page->offset);
-    if (n != (int)file_page->read_bytes) {
-      return false;
-    }
-  }
+	/* 파일에서 필요한 만큼 읽기 */
+	if (file_page->read_bytes > 0) {
+		int n = file_read_at(file_page->file, kva, file_page->read_bytes,
+							file_page->offset);
+		if (n != (int)file_page->read_bytes) {
+		return false;
+		}
+	}
 
-  /* 남은 공간 0으로 채우기 */
-  if (file_page->zero_bytes > 0) {
-    memset((uint8_t *)kva + file_page->read_bytes, 0, file_page->zero_bytes);
-  }
+	/* 남은 공간 0으로 채우기 */
+	if (file_page->zero_bytes > 0) {
+		memset((uint8_t *)kva + file_page->read_bytes, 0, file_page->zero_bytes);
+	}
 
-  return true;
+	return true;
 }
 
 /* Do the munmap */
