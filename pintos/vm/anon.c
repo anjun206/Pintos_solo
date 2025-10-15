@@ -59,13 +59,48 @@ anon_initializer (struct page *page, enum vm_type type, void *kva) {
 /* Swap in the page by read contents from the swap disk. */
 static bool
 anon_swap_in (struct page *page, void *kva) {
-	return true;  // 아직 미구현
+	struct anon_page *anon = &page->anon;
+	size_t slot = anon->slot_idx;
+
+	if (slot == SIZE_MAX) return false;
+	if (swap_disk == NULL) return false;
+
+	lock_acquire(&swap_lock);
+	for (size_t i = 0; i < SECTORS_PER_SLOT; i++) {
+		disk_read(swap_disk, slot * SECTORS_PER_SLOT + i,
+		          (uint8_t *)kva + DISK_SECTOR_SIZE * i);
+	}
+	bitmap_reset(swap_table, slot);
+	anon->slot_idx = SIZE_MAX;
+	lock_release(&swap_lock);
+	return true;
 }
 
 /* Swap out the page by writing contents to the swap disk. */
 static bool
 anon_swap_out (struct page *page) {
-	return true; // 아직 미구현 2
+	struct anon_page *anon = &page->anon;
+	struct frame *frame = page->frame;
+	if (frame == NULL) return false;
+	if (swap_disk == NULL) return false;
+
+	lock_acquire(&swap_lock);
+	size_t slot = anon->slot_idx;
+	if (slot == SIZE_MAX) {
+		slot = bitmap_scan_and_flip(swap_table, 0, 1, false);
+		if (slot == BITMAP_ERROR) {
+			lock_release(&swap_lock);
+			return false;
+		}
+		anon->slot_idx = slot;
+	}
+
+	for (size_t i = 0; i < SECTORS_PER_SLOT; i++) {
+		disk_write(swap_disk, slot * SECTORS_PER_SLOT + i,
+		           (uint8_t *)frame->kva + DISK_SECTOR_SIZE * i);
+	}
+	lock_release(&swap_lock);
+	return true;
 }
 
 /* Destroy the anonymous page. PAGE will be freed by the caller. */

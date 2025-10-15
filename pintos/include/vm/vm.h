@@ -50,6 +50,7 @@ struct page {
 	bool writable;	// 매핑용
 
 	/* Your implementation */
+	struct thread *owner;
 
 	/* Per-type data are binded into the union.
 	 * Each function automatically detects the current union */
@@ -67,6 +68,7 @@ struct page {
 struct frame {
 	void *kva;
 	struct page *page;
+	struct list_elem frame_elem;
 };
 
 /* The function table for page operations.

@@ -1186,47 +1186,35 @@ install_page (void *upage, void *kpage, bool writable) {
 
 static bool
 lazy_load_segment (struct page *page, void *aux_) {
-	/* TODO: Load the segment from the file */
-	/* TODO: 파일에서 세그먼트를 적재한다. */
-
-	/* TODO: This called when the first page fault occurs on address VA. */
-	/* TODO: 이 함수는 VA에서 최초의 페이지 폴트가 발생했을 때 호출된다. */
-
-	/* TODO: VA is available when calling this function. */
-	/* TODO: 이 함수를 호출할 때 VA는 유효하다. */
-
 	struct load_aux *aux = aux_;
 	void *kva = page->frame->kva;
 	struct file_page *file_page = &page->file;
+	size_t read_bytes = aux->read_bytes;
+	size_t zero_bytes = PGSIZE - read_bytes;
 
-	/* 파일에서 필요한 만큼 읽기 */
-	if (aux->read_bytes > 0) {
+	if (read_bytes > 0) {
 		lock_acquire(&filesys_lock);
-		int n = file_read_at(aux->file, kva, aux->read_bytes, aux->ofs);
+		int n = file_read_at(aux->file, kva, read_bytes, aux->ofs);
 		lock_release(&filesys_lock);
-		if (n != (int)aux->read_bytes) {
+		if (n != (int)read_bytes) {
 			free(aux);
 			return false;
 		}
-  	}
+	}
 
-	/* 남은 공간 0으로 채우기 */
-	if (aux->zero_bytes > 0) {
-    	memset((uint8_t *)kva + aux->read_bytes, 0, aux->zero_bytes);
-  	}
+	if (zero_bytes > 0) {
+		memset((uint8_t *)kva + read_bytes, 0, zero_bytes);
+	}
 
-	/* 메타데이터 저장: swap 시 재로딩에 필요 */
-	if (aux->read_bytes == PGSIZE) {
+	if (read_bytes == PGSIZE) {
 		file_page->file = aux->file;
 		file_page->offset = aux->ofs;
-		file_page->read_bytes = aux->read_bytes;
-		file_page->zero_bytes = aux->zero_bytes;
+		file_page->read_bytes = read_bytes;
+		file_page->zero_bytes = zero_bytes;
 	} else {
-		/* 파일이 온전히 backing 하지 못하는 페이지(부분 읽기/zero page)는 익명으로 전환 */
 		anon_initializer(page, VM_ANON, kva);
 	}
-	
-	// file_close(aux->file);
+
 	free(aux);
 	return true;
 }
@@ -1283,10 +1271,9 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 		aux->ofs  = ofs;
 		aux->read_bytes = page_read_bytes;
 		aux->zero_bytes = page_zero_bytes;
-
 		/* 파일-백드 페이지로 lazy 등록 */
 		if (!vm_alloc_page_with_initializer(VM_FILE, upage, writable,
-											lazy_load_segment, aux)) {
+ 							lazy_load_segment, aux)) {
 			free(aux);
 			return false;
 		}
